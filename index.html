@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#F7F2E7" />
+  <meta name="description" content="모바일 최우선 · 오프라인에서도 열리는 7탭 여행 플래너 겸 예약 지갑" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="여행 플래너" />
+  <title>여행 플래너 · 오프라인 여행 지갑</title>
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <a class="skip-link" href="#view">본문으로 건너뛰기</a>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"></circle>
+            <path d="M15.6 8.4l-2.3 5.3-5.3 2.3 2.3-5.3z"></path>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1>여행 플래너</h1>
+          <p>오프라인 여행 지갑 · 7탭</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="net-badge online" id="netBadge" title="네트워크 상태"><i aria-hidden="true"></i><span id="netText">온라인</span></span>
+        <button type="button" class="btn btn-ghost" data-action="open-sync" aria-label="동기화 및 백업 열기">
+          <svg class="btn-ico" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M20 11a8 8 0 1 0-2.4 6.4"/><path d="M20 4.5V11h-6.5"/></svg>
+          <span class="lbl-wide">동기화 / 백업</span><span class="lbl-narrow">동기화</span></button>
+      </div>
+    </header>
+
+    <div class="trip-bar">
+      <button type="button" class="trip-pick" id="tripPick" data-action="open-trip-switch" aria-label="여행 선택기 열기">
+        <span class="trip-flag" id="tripFlag" aria-hidden="true">🌏</span>
+        <span class="trip-pick-text">
+          <strong id="tripPickTitle">여행을 불러오는 중…</strong>
+          <small id="tripPickMeta">잠시만 기다려 주세요</small>
+        </span>
+        <span class="chev" aria-hidden="true">▾</span>
+      </button>
+      <button type="button" class="btn btn-primary" data-action="new-trip">+ 새 여행</button>
+    </div>
+
+    <nav class="tabs" id="tabBar" role="tablist" aria-label="여행 플래너 탭"></nav>
+
+    <main class="view" id="view" role="main"></main>
+
+    <div class="bottom-nav" id="bottomNav" aria-label="페이지 이동"></div>
+  </div>
+
+  <div id="modalRoot" class="modal-root"></div>
+  <div id="toastRoot" class="toast-root" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
