@@ -1391,7 +1391,10 @@
   }
 
   function fieldHTML(f, value) {
-    if (f.type === 'hidden') return '<input type="hidden" name="' + f.name + '" value="' + esc(value === undefined || value === null ? '' : value) + '">';
+    if (f.type === 'hidden') {
+      var hv = (value === undefined || value === null) ? (f.value === undefined || f.value === null ? '' : f.value) : value;
+      return '<input type="hidden" name="' + f.name + '" value="' + esc(hv) + '">';
+    }
     var v = value === undefined || value === null ? (f.value || '') : value;
     var label = '<span>' + esc(f.label) + (f.optional ? ' <small>선택</small>' : '') + '</span>';
     var control = '';
