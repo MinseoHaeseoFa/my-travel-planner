@@ -659,7 +659,7 @@ h1, h2, h3 { letter-spacing: -.02em; }
 
 /* ---------- 동선 추천 모달 ---------- */
 .cur-bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.cur-bar .btn { flex: 0 0 auto; }
+.cur-bar .btn { flex: 0 0 auto; min-height: 44px; }
 .cur-count {
   margin-left: auto; font-size: 11.5px; font-weight: 800;
   color: var(--teal-dark); white-space: nowrap;
@@ -690,7 +690,7 @@ h1, h2, h3 { letter-spacing: -.02em; }
 .cur-group-head h3 { font-size: 12px; font-weight: 800; color: var(--ink-2); }
 .cur-group-head h3 small { color: var(--muted); font-weight: 700; }
 .cur-mini {
-  min-height: 34px; padding: 0 10px; border-radius: 999px;
+  min-height: 44px; padding: 0 11px; border-radius: 999px;
   border: 1px solid var(--line); background: var(--paper);
   font-size: 10.5px; font-weight: 800; color: var(--ink-2); white-space: nowrap;
 }
