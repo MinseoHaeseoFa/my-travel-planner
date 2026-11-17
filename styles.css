@@ -724,6 +724,50 @@ h1, h2, h3 { letter-spacing: -.02em; }
   font-weight: 600; margin-top: 1px; overflow-wrap: anywhere;
 }
 
+
+.cur-netbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 10px; border-radius: 11px; background: var(--paper);
+  border: 1px solid var(--line-2);
+}
+.cur-net {
+  font-size: 10.5px; font-weight: 800; border-radius: 999px; padding: 4px 9px;
+  border: 1px solid var(--line); background: #fff; color: var(--ink-2); white-space: nowrap;
+}
+.cur-net.on { color: #0F6B5C; background: #E3F4EF; border-color: #B7E2D6; }
+.cur-net.load { color: #8B5B0B; background: #FBF0D8; border-color: #EBD6A8; }
+.cur-net.err { color: #92400E; background: #FDECEC; border-color: #F2C9C9; }
+.cur-netmsg { font-size: 10.5px; font-weight: 700; color: var(--muted); overflow-wrap: anywhere; }
+.cur-city-tools { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.cur-mini-main {
+  background: var(--teal-soft); border-color: #B7E2D6; color: var(--teal-dark);
+}
+.cur-src {
+  font-size: 10px; font-weight: 800; border-radius: 8px; padding: 3px 8px;
+  background: var(--paper); color: var(--muted); border: 1px solid var(--line-2);
+  overflow-wrap: anywhere;
+}
+.cur-src.on { color: #0F6B5C; background: #E3F4EF; border-color: #B7E2D6; }
+.cur-src.load { color: #8B5B0B; background: #FBF0D8; }
+.cur-src.err { color: #92400E; background: #FDECEC; }
+.cur-note.ok { color: #0F6B5C; background: #E9F6F1; }
+.cur-bridge {
+  border: 1px solid var(--line); border-radius: 13px; background: #fff; padding: 10px 12px;
+}
+.cur-bridge summary {
+  font-size: 12.5px; font-weight: 800; color: var(--ink); cursor: pointer;
+  min-height: 32px; display: flex; align-items: center;
+}
+.cur-bridge-note { margin: 6px 0 8px; font-size: 10.5px; color: var(--muted); font-weight: 600; line-height: 1.55; }
+.cur-bridge-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.cur-bridge-field { display: block; margin: 8px 0; }
+.cur-bridge-field span { display: block; font-size: 10.5px; font-weight: 800; color: var(--ink-2); margin-bottom: 4px; }
+.cur-bridge-field textarea {
+  width: 100%; min-height: 92px; border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 10px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--paper); color: var(--ink); resize: vertical;
+}
+
 /* ---------- bottom floating nav ---------- */
 .bottom-nav {
   position: fixed; left: 50%; transform: translateX(-50%);

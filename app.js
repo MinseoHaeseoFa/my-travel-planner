@@ -382,6 +382,8 @@
       mode: String(raw.mode || ''),
       arr: String(raw.arr || ''),
       leg: leg,
+      lat: raw.lat === 0 || raw.lat ? raw.lat : '',
+      lon: raw.lon === 0 || raw.lon ? raw.lon : '',
       src: String(raw.src || '')
     };
   }
@@ -1863,53 +1865,417 @@
     return order.map(function (z) { return z + ' ' + count[z]; }).join(' · ');
   }
 
+  /* ---------- 온라인 실시간 검색 (OpenStreetMap Nominatim + Overpass) ---------- */
+  var CUR_NET = { mode: 'idle', city: '', msg: '기본 큐레이션 32개 도시' };
+  var CUR_ONLINE = {};   // city -> { status: 'loading'|'done'|'error', items, center, radius, at, msg }
+  var OSM_NOMINATIM = 'https://nominatim.openstreetmap.org/search';
+  var OSM_OVERPASS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter'
+  ];
+
+  function fetchTimeout(url, opts, ms) {
+    var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, ms || 12000);
+    var o = Object.assign({}, opts || {});
+    if (ctrl) o.signal = ctrl.signal;
+    return fetch(url, o).then(function (r) {
+      clearTimeout(timer);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }, function (e) {
+      clearTimeout(timer);
+      throw e;
+    });
+  }
+
+  function haversineKm(aLat, aLon, bLat, bLon) {
+    var R = 6371, toRad = Math.PI / 180;
+    var dLat = (bLat - aLat) * toRad, dLon = (bLon - aLon) * toRad;
+    var s = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(aLat * toRad) * Math.cos(bLat * toRad) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * R * Math.asin(Math.min(1, Math.sqrt(s)));
+  }
+
+  /* 좌표가 있으면 실제 거리로 이동 시간 추정 (도심 평균 20km/h + 대기) */
+  function travelMin(km) {
+    return Math.max(8, Math.min(60, Math.round(km / 0.33) + 5));
+  }
+
+  function sectorOf(lat, lon, cLat, cLon) {
+    var km = haversineKm(cLat, cLon, lat, lon);
+    if (km < 1.2) return '중심';
+    var dLat = lat - cLat;
+    var dLon = (lon - cLon) * Math.cos(cLat * Math.PI / 180);
+    var deg = (Math.atan2(dLon, dLat) * 180 / Math.PI + 360) % 360;
+    var names = ['북부', '북동부', '동부', '남동부', '남부', '남서부', '서부', '북서부'];
+    return names[Math.round(deg / 45) % 8];
+  }
+
+  function geocodeCity(city) {
+    var url = OSM_NOMINATIM + '?format=json&limit=5&accept-language=ko,en&addressdetails=1&q=' + encodeURIComponent(city);
+    return fetchTimeout(url, { headers: { 'Accept': 'application/json' } }, 12000).then(function (arr) {
+      if (!arr || !arr.length) throw new Error('도시 좌표를 찾지 못했습니다');
+      var cities = arr.filter(function (x) {
+        var t = String(x.addresstype || x.type || '');
+        return ['city', 'town', 'administrative', 'municipality', 'county', 'village'].indexOf(t) >= 0;
+      });
+      var pool = cities.length ? cities : arr;
+      var hit = pool.reduce(function (best, cur) {
+        var bb = cur.boundingbox || [];
+        var size = bb.length === 4 ? Math.abs(Number(bb[1]) - Number(bb[0])) * Math.abs(Number(bb[3]) - Number(bb[2])) : 0;
+        var bestBb = best.boundingbox || [];
+        var bestSize = bestBb.length === 4 ? Math.abs(Number(bestBb[1]) - Number(bestBb[0])) * Math.abs(Number(bestBb[3]) - Number(bestBb[2])) : 0;
+        return size > bestSize ? cur : best;
+      }, pool[0]);
+      var box = hit.boundingbox || [];
+      var lat = Number(hit.lat), lon = Number(hit.lon);
+      var radius = 4000;
+      if (box.length === 4) {
+        var dLatKm = Math.abs(Number(box[1]) - Number(box[0])) * 111;
+        var dLonKm = Math.abs(Number(box[3]) - Number(box[2])) * 111 * Math.cos(lat * Math.PI / 180);
+        radius = Math.max(2200, Math.min(4500, Math.round(Math.max(dLatKm, dLonKm) * 380)));
+      }
+      var shortLabel = String(hit.display_name || city).split(',')[0].trim() || city;
+      return { lat: lat, lon: lon, radius: radius, label: shortLabel };
+    });
+  }
+
+  var OSM_KIND_QUERIES = [
+    ['landmark', 'nwr["tourism"~"^(attraction|viewpoint)$"]["name"]'],
+    ['exp', 'nwr["tourism"~"^(museum|gallery|zoo|theme_park)$"]["name"]'],
+    ['meal', 'nwr["amenity"="restaurant"]["name"]'],
+    ['cafe', 'nwr["amenity"="cafe"]["name"]'],
+    ['stay', 'nwr["tourism"~"^(hotel|guest_house)$"]["name"]']
+  ];
+
+  function osmQueries(center, radius) {
+    return OSM_KIND_QUERIES.map(function (pair) {
+      return '[out:json][timeout:25];' + pair[1] +
+        '(around:' + radius + ',' + center.lat + ',' + center.lon + ');out center 60;';
+    });
+  }
+
+  function overpassGet(url, query, ms) {
+    return fetchTimeout(url + '?data=' + encodeURIComponent(query), {
+      method: 'GET', headers: { 'Accept': 'application/json' }
+    }, ms || 12000);
+  }
+
+  /* 엔드포인트를 바꿔가며 종류별 질의를 병렬로 실행 */
+  function fetchOsmPlaces(center, radius) {
+    var queries = osmQueries(center, radius);
+    var i = 0;
+    function attempt() {
+      if (i >= OSM_OVERPASS.length) return Promise.reject(new Error('Overpass 응답 없음'));
+      var url = OSM_OVERPASS[i++];
+      return Promise.all(queries.map(function (q) { return overpassGet(url, q); }))
+        .then(function (results) {
+          var els = [];
+          results.forEach(function (r) {
+            if (!r || !r.elements) throw new Error('응답 형식 오류');
+            els = els.concat(r.elements);
+          });
+          if (!els.length) throw new Error('빈 응답');
+          return els;
+        })
+        .catch(function () { return attempt(); });
+    }
+    return attempt();
+  }
+
+  function pickOsmName(t) {
+    return t['name:ko'] || t['name:en'] || t.name || '';
+  }
+
+  function osmKind(t) {
+    if (t.tourism === 'hotel' || t.tourism === 'guest_house') return 'stay';
+    if (t.tourism === 'museum' || t.tourism === 'gallery') return 'exp';
+    if (t.tourism === 'attraction' || t.tourism === 'viewpoint') return 'landmark';
+    if (t.amenity === 'restaurant') return 'meal';
+    if (t.amenity === 'cafe') return 'cafe';
+    return '';
+  }
+
+  function osmMemo(t, kind, zone, km) {
+    var bits = [];
+    if (kind === 'meal' && t.cuisine) bits.push('요리: ' + String(t.cuisine).replace(/;/g, '·'));
+    if (kind === 'cafe' && t.cuisine) bits.push('메뉴: ' + String(t.cuisine).replace(/;/g, '·'));
+    if (kind === 'stay') bits.push(t.tourism === 'guest_house' ? '게스트하우스' : '호텔');
+    if (t['addr:street']) bits.push(t['addr:street'] + (t['addr:housenumber'] ? ' ' + t['addr:housenumber'] : ''));
+    if (t.opening_hours) bits.push('영업 ' + t.opening_hours);
+    if (t.website || t['contact:website']) bits.push('웹사이트 있음');
+    bits.push('중심에서 ' + (km < 1 ? (Math.round(km * 1000) + 'm') : km.toFixed(1) + 'km'));
+    bits.push('OSM 실시간 데이터');
+    return bits.join(' · ');
+  }
+
+  function buildOnlineItems(elements, center, radius) {
+    var seen = {};
+    var groups = { landmark: [], exp: [], meal: [], cafe: [], stay: [] };
+    elements.forEach(function (el) {
+      var t = el.tags || {};
+      var name = pickOsmName(t).trim();
+      if (!name) return;
+      var kind = osmKind(t);
+      if (!kind) return;
+      var lat = Number(el.lat || (el.center && el.center.lat));
+      var lon = Number(el.lon || (el.center && el.center.lon));
+      if (!lat || !lon) return;
+      var key = kind + '|' + name;
+      if (seen[key]) return;
+      seen[key] = 1;
+      var km = haversineKm(center.lat, center.lon, lat, lon);
+      if (km > radius / 1000) return;
+      var zone = t['addr:suburb'] || t['addr:neighbourhood'] || t['addr:quarter'] ||
+        t['addr:district'] || t['addr:city_district'] || t['addr:village'] || sectorOf(lat, lon, center.lat, center.lon);
+      groups[kind].push({
+        name: name,
+        kind: kind,
+        zone: String(zone),
+        dur: kind === 'stay' ? 0 : kind === 'exp' ? 120 : kind === 'landmark' ? 90 : kind === 'meal' ? 60 : 50,
+        slot: kind === 'stay' ? 'night' : kind === 'cafe' ? 'afternoon' :
+          kind === 'meal' ? (groups.meal.length % 2 ? 'dinner' : 'lunch') :
+            (t.tourism === 'viewpoint' ? 'sunset' : kind === 'exp' ? 'afternoon' : 'morning'),
+        memo: osmMemo(t, kind, zone, km),
+        lat: lat,
+        lon: lon,
+        km: km
+      });
+    });
+    var limits = { landmark: 10, exp: 6, meal: 12, cafe: 8, stay: 8 };
+    var out = [];
+    ['landmark', 'exp', 'meal', 'cafe', 'stay'].forEach(function (k) {
+      groups[k].sort(function (a, b) { return a.km - b.km; });
+      out = out.concat(groups[k].slice(0, limits[k]));
+    });
+    return out;
+  }
+
+  /* Nominatim 카테고리 검색: 빠르고 전 세계 커버. 이름·좌표·주소 확보 */
+  function fetchNominatimPlaces(center, radius) {
+    var dLat = (radius / 111000) * 1.1;
+    var dLon = (radius / (111000 * Math.max(0.2, Math.cos(center.lat * Math.PI / 180)))) * 1.1;
+    var box = [center.lon - dLon, center.lat + dLat, center.lon + dLon, center.lat - dLat].join(',');
+    var terms = [
+      ['attraction', 'landmark'], ['museum', 'exp'],
+      ['restaurant', 'meal'], ['cafe', 'cafe'], ['hotel', 'stay']
+    ];
+    return Promise.all(terms.map(function (pair) {
+      var params = '?q=' + encodeURIComponent(pair[0]) +
+        '&format=json&limit=25&bounded=1&viewbox=' + box +
+        '&accept-language=ko,en&namedetails=1&extratags=1&addressdetails=1';
+      return fetchTimeout(OSM_NOMINATIM + params, { headers: { 'Accept': 'application/json' } }, 14000)
+        .then(function (arr) { return { kind: pair[1], arr: arr || [] }; })
+        .catch(function () { return { kind: pair[1], arr: [] }; });
+    })).then(function (sets) {
+      var out = [];
+      sets.forEach(function (set) {
+        set.arr.forEach(function (hit) {
+          var nm = hit.namedetails || {};
+          var name = String(nm['name:ko'] || nm['name:en'] || hit.name || (hit.display_name || '').split(',')[0] || '').trim();
+          if (!name) return;
+          var lat = Number(hit.lat), lon = Number(hit.lon);
+          if (!lat || !lon) return;
+          var ad = hit.address || {};
+          var zone = ad.city_district || ad.borough || ad.suburb || ad.town || ad.village ||
+            sectorOf(lat, lon, center.lat, center.lon);
+          var lname = name.toLowerCase();
+          if (lname.length < 2) return;
+          if (/photo|print|vending|toilet|parking|atm|bank|shop|coin|\d+f\)|\d+층|kiosk/i.test(name)) return;
+          if (/^(restaurants?|cafes?|hotels?|attractions?|museum|store|storefront|food court)$/i.test(name)) return;
+          var type = String(hit.type || '');
+          var kind = set.kind;
+          var slot = kind === 'stay' ? 'night' : kind === 'cafe' ? 'afternoon' :
+            kind === 'meal' ? 'lunch' : (type === 'artwork' || type === 'viewpoint' ? 'sunset' : kind === 'exp' ? 'afternoon' : 'morning');
+          var bits = [];
+          if (hit.extratags && hit.extratags.cuisine) bits.push('요리: ' + String(hit.extratags.cuisine).replace(/;/g, '·'));
+          if (hit.extratags && hit.extratags.opening_hours) bits.push('영업 ' + hit.extratags.opening_hours);
+          bits.push('OSM Nominatim · ' + (hit.type || 'place'));
+          var km = haversineKm(center.lat, center.lon, lat, lon);
+          bits.push('중심 ' + (km < 1 ? Math.round(km * 1000) + 'm' : km.toFixed(1) + 'km'));
+          out.push({
+            name: name, kind: kind, zone: String(zone),
+            dur: kind === 'stay' ? 0 : kind === 'exp' ? 120 : kind === 'landmark' ? 90 : kind === 'meal' ? 60 : 50,
+            slot: slot,
+            memo: bits.join(' · '), lat: lat, lon: lon, km: km
+          });
+        });
+      });
+      var seen = {};
+      var kept = [];
+      out.forEach(function (x) {
+        var k = x.kind + '|' + x.name.toLowerCase().replace(/\s+/g, '');
+        if (seen[k]) return;
+        var nearDup = kept.some(function (y) {
+          if (y.kind !== x.kind) return false;
+          var km = haversineKm(y.lat, y.lon, x.lat, x.lon);
+          if (km > 0.09) return false;
+          var a = y.name.toLowerCase().replace(/\s+/g, '');
+          var b = x.name.toLowerCase().replace(/\s+/g, '');
+          return a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+        });
+        if (nearDup) return;
+        seen[k] = 1;
+        kept.push(x);
+      });
+      return kept;
+    });
+  }
+
+  function mergeOnlineItems(a, b) {
+    var seen = {}, out = [];
+    a.concat(b).forEach(function (x) {
+      var k = x.kind + '|' + x.name;
+      if (seen[k]) return;
+      seen[k] = 1;
+      out.push(x);
+    });
+    var limits = { landmark: 14, exp: 8, meal: 16, cafe: 10, stay: 10 };
+    var groups = { landmark: [], exp: [], meal: [], cafe: [], stay: [] };
+    out.forEach(function (x) { if (groups[x.kind]) groups[x.kind].push(x); });
+    var result = [];
+    var preselect = { landmark: 6, exp: 3, meal: 6, cafe: 3, stay: 2 };
+    ['landmark', 'exp', 'meal', 'cafe', 'stay'].forEach(function (k) {
+      groups[k].slice(0, limits[k]).forEach(function (x, idx) {
+        x.pick = idx < preselect[k];
+        result.push(x);
+      });
+    });
+    return result;
+  }
+
+  /* 2단계: Nominatim 즉시 → Overpass 도착하면 보강 */
+  function onlineCuration(city, onPartial) {
+    if (typeof fetch !== 'function') return Promise.reject(new Error('이 브라우저는 실시간 검색을 지원하지 않습니다'));
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return Promise.reject(new Error('오프라인 상태입니다'));
+    return geocodeCity(city).then(function (center) {
+      var ovpItems = [];
+      var ovpDone = false;
+      var ovp = fetchOsmPlaces(center, center.radius).then(function (els) {
+        ovpItems = buildOnlineItems(els, center, center.radius);
+        ovpDone = true;
+        return ovpItems;
+      }).catch(function () { ovpDone = true; return []; });
+      return fetchNominatimPlaces(center, center.radius).then(function (nom) {
+        if (!nom.length && !ovpItems.length) {
+          return ovp.then(function (extra) {
+            var merged0 = mergeOnlineItems(nom, extra);
+            if (!merged0.length) throw new Error('주변 장소를 찾지 못했습니다');
+            return { items: merged0, center: center, radius: center.radius, osm: extra.length };
+          });
+        }
+        var first = mergeOnlineItems(nom, ovpItems);
+        if (onPartial && first.length) onPartial({ items: first, center: center, radius: center.radius, partial: true });
+        return ovp.then(function (extra) {
+          var merged = mergeOnlineItems(nom, extra);
+          return { items: merged, center: center, radius: center.radius, osm: extra.length };
+        });
+      });
+    });
+  }
+
+  function curBadge() {
+    var map = {
+      idle: ['📦 기본 큐레이션', 'off'],
+      loading: ['⏳ 실시간 검색 중…', 'load'],
+      done: ['🌐 온라인 실시간 검색', 'on'],
+      error: ['📦 기본 큐레이션 · 온라인 실패', 'err']
+    };
+    var v = map[CUR_NET.mode] || map.idle;
+    return '<span class="cur-net ' + v[1] + '" id="curNet">' + v[0] + '</span>';
+  }
+
+  function curSectionHtml(city, t) {
+    var online = CUR_ONLINE[city];
+    var useOnline = online && online.status === 'done';
+    var base = curationFor(city);
+    var info = useOnline
+      ? { country: base.country, fallback: false, list: online.items }
+      : base;
+    var kinds = CUR_KIND_ORDER.filter(function (k) {
+      return info.list.some(function (x) { return x.kind === k; });
+    });
+    var zoneCount = Object.keys(info.list.reduce(function (m, x) { if (x.kind !== 'stay') m[x.zone] = 1; return m; }, {})).length;
+    var head = '<div class="cur-city-head">' +
+      '<span class="cur-flag">' + codeOf(info.country || t.country) + '</span>' +
+      '<strong>' + esc(city) + '</strong>' +
+      '<span class="cur-route">' + info.list.length + '곳 · 권역 ' + zoneCount + '</span>' +
+    '</div>' +
+    '<div class="cur-city-tools">' +
+      (useOnline
+        ? '<span class="cur-src on">🌐 실시간 · ' + esc((online.center && online.center.label || '').split(',').slice(0, 2).join(',')) + '</span>' +
+          '<button type="button" class="cur-mini" data-action="cur-online" data-city="' + esc(city) + '">🔄 새로고침</button>' +
+          '<button type="button" class="cur-mini" data-action="cur-static" data-city="' + esc(city) + '">📦 기본 큐레이션</button>'
+        : (online && online.status === 'loading'
+          ? '<span class="cur-src load">⏳ Nominatim·Overpass 조회 중…</span>'
+          : '<button type="button" class="cur-mini cur-mini-main" data-action="cur-online" data-city="' + esc(city) + '">🌐 실시간 전 세계 검색</button>' +
+            (online && online.status === 'error' ? '<span class="cur-src err">' + esc(online.msg || '검색 실패') + '</span>' : ''))) +
+    '</div>';
+
+    var note = '';
+    if (useOnline) {
+      note = '<p class="cur-note ok">OpenStreetMap 실시간 조회 결과입니다. 좌표가 있어 실제 거리로 이동 시간을 계산합니다. 평점·최신 리뷰는 🤖 김비서 패널로 보강하세요.</p>';
+    } else if (base.fallback) {
+      note = '<p class="cur-note">기본 DB에 없는 도시입니다. <b>🌐 실시간 전 세계 검색</b>을 누르면 OSM에서 실제 장소를 즉시 가져옵니다(오프라인일 때만 자리표시자).</p>';
+    }
+
+    return '<section class="cur-city" data-curcity="' + esc(city) + '">' + head + note +
+      '<div class="cur-zones"><b>권역</b><span>' + esc(curationZoneSummary(info.list)) + '</span></div>' +
+      kinds.map(function (kind) {
+        var items = info.list.filter(function (x) { return x.kind === kind; });
+        return '<div class="cur-group" data-city="' + esc(city) + '" data-kind="' + kind + '">' +
+          '<div class="cur-group-head"><h3>' + CUR_KIND_LABEL[kind] + ' <small>' + items.length + '</small></h3>' +
+            '<button type="button" class="cur-mini" data-action="cur-cat" data-city="' + esc(city) + '" data-kind="' + kind + '" aria-label="' + esc(city) + ' ' + esc(CUR_KIND_LABEL[kind]) + ' 전체 선택">카테고리 전체</button></div>' +
+          items.map(function (it, i) {
+            var isStay = it.kind === 'stay';
+            var meta = isStay
+              ? '숙박 · ' + it.zone + ' 권역'
+              : it.zone + ' · 예상 ' + it.dur + '분 · ' + (CUR_SLOT_LABEL[it.slot] || '오후') + ' 추천';
+            return '<label class="cur-item">' +
+              '<input type="checkbox" data-cur="' + esc(city + '||' + kind + '||' + i) + '" data-city="' + esc(city) + '" data-kind="' + kind + '" data-name="' + esc(it.name) + '" data-memo="' + esc(it.memo) + '" data-zone="' + esc(it.zone) + '" data-dur="' + it.dur + '" data-slot="' + esc(it.slot) + '" data-country="' + esc(info.country) + '" data-lat="' + (it.lat || '') + '" data-lon="' + (it.lon || '') + '"' + (info.fallback ? ' data-fallback="1"' : '') + ((useOnline && it.pick === false) ? '' : ' checked') + '>' +
+              '<span class="cur-name">' + esc(it.name) + '</span>' +
+              '<span class="cur-meta">' + esc(meta) + '</span>' +
+              '<span class="cur-memo">' + esc(it.memo) + '</span>' +
+            '</label>';
+          }).join('') +
+        '</div>';
+      }).join('') +
+    '</section>';
+  }
+
+  function bridgePanelHtml(t) {
+    return '<details class="cur-bridge">' +
+      '<summary>🤖 김비서에게 최신 리뷰 맞춤 추천 받기</summary>' +
+      '<p class="cur-bridge-note">정적 앱은 실시간 리뷰·평점을 직접 읽지 못합니다. 요청문을 복사해 김비서에게 보내면, 김비서가 최신 리뷰를 검색해 아래 형식의 JSON으로 돌려줍니다. 붙여넣고 적용하면 같은 스케줄러가 동선·시간을 계산해 일정에 넣습니다.</p>' +
+      '<div class="cur-bridge-row">' +
+        '<button type="button" class="btn btn-ghost btn-sm" data-action="cur-copy-request">📋 요청문 복사</button>' +
+        '<button type="button" class="btn btn-ghost btn-sm" data-action="cur-copy-schema">🧩 JSON 형식 복사</button>' +
+      '</div>' +
+      '<label class="cur-bridge-field"><span>김비서가 준 JSON 붙여넣기</span>' +
+        '<textarea id="curJson" rows="4" placeholder=\'{"cities":{"도쿄":[{"name":"스시 잔마이 본점","kind":"meal","zone":"아사쿠사","durationMin":60,"bestSlot":"lunch","memo":"리뷰 4.4 · 3천엔대","lat":35.71,"lon":139.79}]}}\'></textarea>' +
+      '</label>' +
+      '<button type="button" class="btn btn-primary btn-sm" data-action="cur-import">JSON 적용</button>' +
+    '</details>';
+  }
+
   function openCuration() {
     var t = activeTrip();
     if (!t) return;
     if (!t.cities.length) { toast('여행 도시를 먼저 등록해 주세요'); return; }
-    var body = t.cities.map(function (city) {
-      var info = curationFor(city);
-      var kinds = CUR_KIND_ORDER.filter(function (k) {
-        return info.list.some(function (x) { return x.kind === k; });
-      });
-      return '<section class="cur-city">' +
-        '<div class="cur-city-head">' +
-          '<span class="cur-flag">' + codeOf(info.country || t.country) + '</span>' +
-          '<strong>' + esc(city) + '</strong>' +
-          '<span class="cur-route">' + info.list.length + '곳 · 권역 ' + Object.keys(info.list.reduce(function (m, x) { if (x.kind !== 'stay') m[x.zone] = 1; return m; }, {})).length + '</span>' +
-        '</div>' +
-        (info.fallback ? '<p class="cur-note">추천 DB에 없는 도시라 기본 골격(자리표시자)으로 채웁니다. 채운 뒤 ✏️ 수정으로 실제 장소를 입력하세요.</p>' : '') +
-        '<div class="cur-zones"><b>권역</b><span>' + esc(curationZoneSummary(info.list)) + '</span></div>' +
-        kinds.map(function (kind) {
-          var items = info.list.filter(function (x) { return x.kind === kind; });
-          return '<div class="cur-group" data-city="' + esc(city) + '" data-kind="' + kind + '">' +
-            '<div class="cur-group-head"><h3>' + CUR_KIND_LABEL[kind] + ' <small>' + items.length + '</small></h3>' +
-              '<button type="button" class="cur-mini" data-action="cur-cat" data-city="' + esc(city) + '" data-kind="' + kind + '" aria-label="' + esc(city) + ' ' + esc(CUR_KIND_LABEL[kind]) + ' 전체 선택">카테고리 전체</button></div>' +
-            items.map(function (it, i) {
-              var isStay = it.kind === 'stay';
-              var meta = isStay
-                ? '숙박 · ' + it.zone + ' 권역'
-                : it.zone + ' · 예상 ' + it.dur + '분 · ' + (CUR_SLOT_LABEL[it.slot] || '오후') + ' 추천';
-              return '<label class="cur-item">' +
-                '<input type="checkbox" data-cur="' + esc(city + '||' + kind + '||' + i) + '" data-city="' + esc(city) + '" data-kind="' + kind + '" data-name="' + esc(it.name) + '" data-memo="' + esc(it.memo) + '" data-zone="' + esc(it.zone) + '" data-dur="' + it.dur + '" data-slot="' + esc(it.slot) + '" data-country="' + esc(info.country) + '"' + (info.fallback ? ' data-fallback="1"' : '') + ' checked>' +
-                '<span class="cur-name">' + esc(it.name) + '</span>' +
-                '<span class="cur-meta">' + esc(meta) + '</span>' +
-                '<span class="cur-memo">' + esc(it.memo) + '</span>' +
-              '</label>';
-            }).join('') +
-          '</div>';
-        }).join('') +
-      '</section>';
-    }).join('');
+    var body = t.cities.map(function (city) { return curSectionHtml(city, t); }).join('');
 
     openModal(
-      modalHead('✨ 동선 추천 채우기', '같은 권역끼리 같은 날로 묶고, 체류 시간·이동 버퍼(같은 권역 15분·다른 권역 30분)까지 계산해 시작 시각이 겹치지 않게 배치합니다.') +
+      modalHead('✨ 동선 추천 채우기', '기본은 온라인입니다. 여행지를 고르면 OSM 실시간 조회로 실제 장소·좌표를 가져오고, 좌표 거리로 이동 시간을 계산해 시작 시각이 겹치지 않게 배치합니다.') +
       '<div class="modal-body">' +
         '<div class="cur-bar">' +
           '<button type="button" class="btn btn-ghost btn-sm" data-action="cur-all">모두 선택</button>' +
           '<button type="button" class="btn btn-ghost btn-sm" data-action="cur-none">모두 해제</button>' +
           '<span class="cur-count" id="curCount"></span>' +
         '</div>' +
+        '<div class="cur-netbar">' + curBadge() + '<span class="cur-netmsg" id="curNetMsg">' + esc(CUR_NET.msg) + '</span></div>' +
+        bridgePanelHtml(t) +
         body +
         '<p class="hint">' + esc(CURATION_META.note || '실존 장소·권역 기준 추천입니다. 영업시간은 방문 전 지도에서 확인하세요.') + '</p>' +
         '<p class="hint">숙박 호텔은 일정이 아니라 <b>정보 탭 숙소 카드</b>에 등록되고, 박 수에 맞춰 순서대로 배분됩니다.</p>' +
@@ -1921,6 +2287,207 @@
       true
     );
     updateCurCount();
+    if (CUR_NET.mode !== 'loading') autoOnlineCities(t);
+  }
+
+  /* 열자마자 DB에 없는 도시는 실시간으로 채운다(온라인일 때만) */
+  function autoOnlineCities(t) {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    var missing = t.cities.filter(function (c) { return !CURATION[c] && !CUR_ONLINE[c]; });
+    if (missing.length) loadOnlineCity(missing[0]);
+  }
+
+  function refreshCurCity(city) {
+    var t = activeTrip();
+    if (!t) return;
+    var node = document.querySelector('[data-curcity="' + String(city).replace(/"/g, '\\"') + '"]');
+    if (!node) return;
+    var wrap = document.createElement('div');
+    wrap.innerHTML = curSectionHtml(city, t);
+    var fresh = wrap.firstElementChild;
+    node.parentNode.replaceChild(fresh, node);
+    var badge = $('#curNet');
+    if (badge) {
+      var tmp = document.createElement('div');
+      tmp.innerHTML = curBadge();
+      badge.parentNode.replaceChild(tmp.firstElementChild, badge);
+    }
+    var msg = $('#curNetMsg');
+    if (msg) msg.textContent = CUR_NET.msg;
+    updateCurCount();
+  }
+
+  function loadOnlineCity(city) {
+    if (!city) return;
+    CUR_ONLINE[city] = { status: 'loading' };
+    CUR_NET.mode = 'loading';
+    CUR_NET.city = city;
+    CUR_NET.msg = city + ' 실시간 조회 중 · Nominatim → Overpass';
+    refreshCurCity(city);
+    onlineCuration(city, function (part) {
+      CUR_ONLINE[city] = { status: 'done', items: part.items, center: part.center, radius: part.radius, at: Date.now(), partial: true };
+      CUR_NET.mode = 'loading';
+      CUR_NET.msg = city + ' · 기본 결과 ' + part.items.length + '곳 · 추가 검색 중…';
+      refreshCurCity(city);
+    }).then(function (res) {
+      CUR_ONLINE[city] = {
+        status: 'done', items: res.items, center: res.center, radius: res.radius, at: Date.now()
+      };
+      CUR_NET.mode = 'done';
+      CUR_NET.msg = city + ' · 실시간 ' + res.items.length + '곳 (반경 ' + Math.round(res.radius / 1000 * 10) / 10 + 'km)';
+      refreshCurCity(city);
+      toast(city + ' 실시간 검색 완료 · ' + res.items.length + '곳');
+    }).catch(function (e) {
+      CUR_ONLINE[city] = { status: 'error', msg: String((e && e.message) || e) };
+      CUR_NET.mode = 'error';
+      CUR_NET.msg = city + ' 실시간 검색 실패 · 기본 큐레이션 유지';
+      refreshCurCity(city);
+      toast('실시간 검색 실패 · 기본 큐레이션 사용 (' + ((e && e.message) || '네트워크') + ')');
+    });
+  }
+
+  function curRequestText(t) {
+    var legs = [];
+    if (t.outbound && t.outbound.from) {
+      legs.push('출발 ' + t.outbound.from + ' → ' + t.outbound.to + ' · ' + (t.outbound.mode || '') + ' · ' + (t.outbound.dep || '') + '~' + (t.outbound.arr || ''));
+    }
+    if (t.inbound && t.inbound.from) {
+      legs.push('귀환 ' + t.inbound.from + ' → ' + t.inbound.to + ' · ' + (t.inbound.mode || '') + ' · ' + (t.inbound.dep || '') + '~' + (t.inbound.arr || ''));
+    }
+    var lines = [
+      '[여행 플래너 동선 추천 요청]',
+      '여행: ' + t.title,
+      '국가: ' + t.country + ' / 도시: ' + t.cities.join(', '),
+      '기간: ' + fullDateLabel(t.start) + ' ~ ' + fullDateLabel(t.end) + ' (' + t.days.length + '일)',
+      legs.join('\n'),
+      '스타일: 미식·카페·핵심 명소 균형 (호캉스·혼여행이면 조정)',
+      '',
+      '요청: 도시별로 랜드마크 6~8, 맛집 5~6, 카페 4~5, 호텔 3~4를 최신 리뷰 기준 실존 상호로 추천해줘. 추상 명칭(무슨 거리·무슨 시장·권역 호텔) 금지, 실제 상호만. 결과는 아래 JSON 하나로만 답해줘.',
+      '{"cities":{"도시명":[{"name":"실제 상호","kind":"landmark|exp|meal|cafe|stay","zone":"권역","durationMin":90,"bestSlot":"morning|lunch|afternoon|sunset|dinner|night","memo":"한 줄 리뷰 포인트·가격대","lat":35.0,"lon":139.0}]}}'
+    ];
+    return lines.filter(Boolean).join('\n');
+  }
+
+  function curSchemaText() {
+    return JSON.stringify({
+      cities: {
+        '도쿄': [
+          { name: '스시 잔마이 본점', kind: 'meal', zone: '아사쿠사', durationMin: 60, bestSlot: 'lunch', memo: '리뷰 4.4 · 해산물 스시 3천엔대', lat: 35.7107, lon: 139.7965 },
+          { name: '호텔 그레이서리 신주쿠', kind: 'stay', zone: '신주쿠', durationMin: 0, bestSlot: 'night', memo: '신주쿠역 인접 4성', lat: 35.6938, lon: 139.6993 }
+        ]
+      }
+    }, null, 2);
+  }
+
+  function copyText(text, okMsg) {
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', 'readonly');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      toast(ok ? okMsg : '복사하지 못했습니다 · 길게 눌러 직접 복사해 주세요');
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText && window.isSecureContext) {
+      navigator.clipboard.writeText(text).then(function () { toast(okMsg); }, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  function normImportKind(k) {
+    var v = String(k || '').toLowerCase();
+    if (v === 'attraction' || v === 'landmark' || v === 'sight' || v === '명소') return 'landmark';
+    if (v === 'exp' || v === 'experience' || v === 'museum' || v === '체험') return 'exp';
+    if (v === 'meal' || v === 'restaurant' || v === 'food' || v === '맛집') return 'meal';
+    if (v === 'cafe' || v === '카페') return 'cafe';
+    if (v === 'stay' || v === 'hotel' || v === '숙소' || v === '호텔') return 'stay';
+    return '';
+  }
+
+  function importCurationJSON(text) {
+    var t = activeTrip();
+    if (!t) return;
+    var data;
+    try { data = JSON.parse(String(text || '').trim()); }
+    catch (e) { toast('JSON 형식이 아닙니다 · 김비서가 준 JSON을 그대로 붙여넣어 주세요'); return; }
+
+    var entries = [];
+    function push(city, it) {
+      if (!city || !it) return;
+      var kind = normImportKind(it.kind || it.type);
+      var name = String(it.name || it.title || '').trim();
+      if (!name || !kind) return;
+      var dur = Number(it.durationMin != null ? it.durationMin : it.dur);
+      entries.push({
+        city: String(city),
+        name: name,
+        kind: kind,
+        zone: String(it.zone || it.area || '중심'),
+        dur: isFinite(dur) && dur > 0 ? dur : (kind === 'stay' ? 0 : 60),
+        slot: CUR_SLOT_LABEL[it.bestSlot] ? it.bestSlot : (CUR_SLOT_LABEL[it.slot] ? it.slot : (kind === 'stay' ? 'night' : 'afternoon')),
+        memo: String(it.memo || it.note || '김비서 추천'),
+        lat: Number(it.lat || (it.coords && it.coords.lat) || 0) || 0,
+        lon: Number(it.lon || it.lng || (it.coords && it.coords.lon) || 0) || 0,
+        country: String(it.country || t.country),
+        fallback: false
+      });
+    }
+
+    if (data && data.cities && typeof data.cities === 'object' && !Array.isArray(data.cities)) {
+      Object.keys(data.cities).forEach(function (city) {
+        var arr = data.cities[city];
+        if (Array.isArray(arr)) arr.forEach(function (it) { push(city, it); });
+      });
+    }
+    if (Array.isArray(data)) {
+      data.forEach(function (it) { push(it.city || it['도시'] || (t.cities[0] || ''), it); });
+    }
+    if (data && Array.isArray(data.items)) {
+      data.items.forEach(function (it) { push(it.city || (t.cities[0] || ''), it); });
+    }
+    if (!entries.length) { toast('적용할 항목이 없습니다 · name·kind를 확인해 주세요'); return; }
+
+    var stats = { plan: 0, food: 0, lodging: 0, skip: 0, zones: 0 };
+    applyEntries(t, entries, stats);
+    CUR_NET.mode = 'done';
+    CUR_NET.msg = '김비서 JSON ' + entries.length + '항목 반영';
+    commitCuration(t, stats, '김비서 JSON');
+  }
+
+  function applyEntries(t, entries, stats) {
+    var cities = [];
+    entries.forEach(function (p) { if (cities.indexOf(p.city) < 0) cities.push(p.city); });
+    cities.forEach(function (city) {
+      fillCityCuration(t, city, entries.filter(function (p) { return p.city === city; }), stats);
+    });
+  }
+
+  function commitCuration(t, stats, label) {
+    if (!stats.plan && !stats.food && !stats.lodging) {
+      closeModal();
+      toast('선택한 항목이 이미 모두 채워져 있어요');
+      return;
+    }
+    var firstDay = t.days.filter(function (d) {
+      return d.items.some(function (x) { return x.src === 'curation'; });
+    })[0];
+    touchTrip(t);
+    save();
+    closeModal();
+    ui.tab = 'plan';
+    ui.allDays = false;
+    if (firstDay) ui.day = firstDay.n;
+    render();
+    window.scrollTo(0, 0);
+    toast((label ? label + ' · ' : '') + '일정 ' + stats.plan + ' · 맛집 ' + stats.food + ' · 숙소 ' + stats.lodging + '개 배치' +
+      (stats.zones ? ' · 권역 ' + stats.zones + '개 묶음' : '') +
+      (stats.skip ? ' (중복·시간초과 ' + stats.skip + '개 제외)' : ''));
   }
 
   function updateCurCount() {
@@ -1955,37 +2522,16 @@
         dur: Number(b.dataset.dur) || (b.dataset.kind === 'stay' ? 0 : 60),
         slot: b.dataset.slot || 'afternoon',
         country: b.dataset.country,
+        lat: Number(b.dataset.lat) || 0,
+        lon: Number(b.dataset.lon) || 0,
         fallback: b.dataset.fallback === '1'
       });
     });
     if (!picked.length) { toast('채울 항목을 1개 이상 선택해 주세요'); return; }
 
     var stats = { plan: 0, food: 0, lodging: 0, skip: 0, zones: 0 };
-    var cities = [];
-    picked.forEach(function (p) { if (cities.indexOf(p.city) < 0) cities.push(p.city); });
-    cities.forEach(function (city) {
-      fillCityCuration(t, city, picked.filter(function (p) { return p.city === city; }), stats);
-    });
-
-    if (!stats.plan && !stats.food && !stats.lodging) {
-      closeModal();
-      toast('선택한 항목이 이미 모두 채워져 있어요');
-      return;
-    }
-    var firstDay = t.days.filter(function (d) {
-      return d.items.some(function (x) { return x.src === 'curation'; });
-    })[0];
-    touchTrip(t);
-    save();
-    closeModal();
-    ui.tab = 'plan';
-    ui.allDays = false;
-    if (firstDay) ui.day = firstDay.n;
-    render();
-    window.scrollTo(0, 0);
-    toast('일정 ' + stats.plan + ' · 맛집 ' + stats.food + ' · 숙소 ' + stats.lodging + '개 배치' +
-      (stats.zones ? ' · 권역 ' + stats.zones + '개 묶음' : '') +
-      (stats.skip ? ' (중복·시간초과 ' + stats.skip + '개 제외)' : ''));
+    applyEntries(t, picked, stats);
+    commitCuration(t, stats, CUR_NET.mode === 'done' ? '실시간 검색' : '');
   }
 
   /* 여행 첫날 도착·마지막날 출발 시각을 반영한 하루 가용 시간 창 */
@@ -2045,21 +2591,25 @@
     function overlaps(ranges, s, e) {
       return ranges.some(function (r) { return s < r[1] && e > r[0]; });
     }
-    function tryPlace(d, e, from) {
+    function tryPlace(d, e, from, anySlot) {
       var win = windows[d.n];
       var slotMin = CUR_SLOT_START[e.slot] == null ? win[0] : CUR_SLOT_START[e.slot];
       var slotMax = CUR_SLOT_END[e.slot] == null ? win[1] : CUR_SLOT_END[e.slot];
-      var limit = Math.min(win[1], slotMax);
-      var start = Math.max(from, Math.max(slotMin, win[0]));
+      var limit = anySlot ? Math.min(win[1], slotMax + 150) : Math.min(win[1], slotMax);
+      var start = Math.max(from, Math.max(anySlot ? Math.max(win[0], slotMin - 60) : slotMin, win[0]));
       start = Math.ceil(start / 5) * 5;
       var need = Math.max(20, e.dur);
-      for (var k = 0; k < 42; k++) {
+      for (var k = 0; k < 60; k++) {
         var end = start + need;
         if (end > limit) return null;
-        if (!overlaps(occupied[d.n], start, end)) {
-          return start;
-        }
-        start += 10;
+        var clashEnd = null;
+        occupied[d.n].forEach(function (r) {
+          if (start < r[1] && end > r[0]) {
+            if (clashEnd === null || r[1] < clashEnd) clashEnd = r[1];
+          }
+        });
+        if (clashEnd === null) return start;
+        start = Math.ceil(clashEnd / 5) * 5;
       }
       return null;
     }
@@ -2123,16 +2673,25 @@
       });
       var cursor = windows[d.n][0];
       var prevZone = '';
+      var prevItem = null;
       var placedCount = 0;
       pool.forEach(function (e) {
         if (placedCount >= CUR_DAY_LIMIT) { overflow.push(e); return; }
-        var buffer = prevZone ? (prevZone === e.zone ? CUR_BUF_SAME : CUR_BUF_DIFF) : 0;
+        var buffer = 0;
+        if (prevZone) {
+          if (prevItem && prevItem.lat && prevItem.lon && e.lat && e.lon) {
+            buffer = travelMin(haversineKm(Number(prevItem.lat), Number(prevItem.lon), Number(e.lat), Number(e.lon)));
+          } else {
+            buffer = prevZone === e.zone ? CUR_BUF_SAME : CUR_BUF_DIFF;
+          }
+        }
         var placed = tryPlace(d, e, cursor + buffer);
         if (placed === null) { overflow.push(e); return; }
         occupied[d.n].push([placed, placed + Math.max(20, e.dur)]);
         pushCurationItem(t, d, e, placed, city, country);
         cursor = Math.max(cursor, placed + Math.max(20, e.dur));
         prevZone = e.zone;
+        prevItem = e;
         placedCount++;
         dayPlaced[d.n] = (dayPlaced[d.n] || 0) + 1;
         stats.plan++;
@@ -2150,8 +2709,8 @@
       for (var i = 0; i < ordered.length; i++) {
         var d = ordered[i];
         if ((dayPlaced[d.n] || 0) >= CUR_DAY_LIMIT) continue;
-        if (load[d.n].zones.length >= maxZonesPerDay + 1 && load[d.n].zones.indexOf(e.zone) < 0) continue;
-        var placed = tryPlace(d, e, windows[d.n][0]);
+        if (load[d.n].zones.length >= Math.max(3, maxZonesPerDay + 1) && load[d.n].zones.indexOf(e.zone) < 0) continue;
+        var placed = tryPlace(d, e, windows[d.n][0], true);
         if (placed !== null) {
           occupied[d.n].push([placed, placed + Math.max(20, e.dur)]);
           if (load[d.n].zones.indexOf(e.zone) < 0) load[d.n].zones.push(e.zone);
@@ -2179,6 +2738,7 @@
       place: e.fallback ? '' : e.name,
       memo: memo,
       country: country,
+      lat: e.lat || '', lon: e.lon || '',
       from: '', to: '', fromCountry: '', toCountry: '', mode: '', arr: '', leg: '',
       src: e.fallback ? 'skeleton' : 'curation'
     });
@@ -2973,6 +3533,24 @@
       setCurBoxes(!all, el.dataset.city, el.dataset.kind);
     },
     'cur-apply': function () { applyCuration(); },
+    'cur-online': function (el) { loadOnlineCity(el.dataset.city); },
+    'cur-static': function (el) {
+      delete CUR_ONLINE[el.dataset.city];
+      CUR_NET.mode = 'idle';
+      CUR_NET.msg = '기본 큐레이션으로 전환 · ' + el.dataset.city;
+      refreshCurCity(el.dataset.city);
+    },
+    'cur-copy-request': function () {
+      var t = activeTrip();
+      if (t) copyText(curRequestText(t), '요청문을 복사했어요 · 김비서에게 붙여넣기');
+    },
+    'cur-copy-schema': function () {
+      copyText(curSchemaText(), 'JSON 형식을 복사했어요');
+    },
+    'cur-import': function () {
+      var ta = document.getElementById('curJson');
+      importCurationJSON(ta ? ta.value : '');
+    },
     'del-item': function (el) {
       var found = findItem(el.dataset.id);
       if (!found) return;
