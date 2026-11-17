@@ -3,11 +3,12 @@
    - 같은 출처 GET은 네트워크 우선, 실패하면 캐시로 응답
    - 구글 시트(Apps Script) 요청은 캐시하지 않고 그대로 통과
 */
-const CACHE = 'mtp-shell-v1';
+const CACHE = 'mtp-shell-v2-20261118b';
 const SHELL = [
   './',
   './index.html',
   './styles.css',
+  './curation.js',
   './app.js',
   './manifest.webmanifest',
   './icons/icon-192.png',
@@ -46,7 +47,9 @@ self.addEventListener('fetch', (event) => {
         return res;
       })
       .catch(() =>
-        caches.match(req).then((hit) => hit || caches.match('./index.html'))
+        caches.match(req).then((hit) =>
+          hit || caches.match(req.url.split('?')[0]) || caches.match('./index.html')
+        )
       )
   );
 });
