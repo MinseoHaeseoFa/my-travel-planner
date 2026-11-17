@@ -1807,16 +1807,23 @@
     toast(v.id ? '구간 이동을 수정했어요' : '구간 이동을 추가했어요');
   }
 
-  /* ---------- 동선 추천 (큐레이션 마스터 DB) ---------- */
+  /* ---------- 동선 추천 (큐레이션 DB · 권역/체류시간/시간대 기반 스케줄러) ---------- */
   var CUR_KIND_ORDER = ['landmark', 'exp', 'meal', 'cafe', 'stay'];
-  var CUR_KIND_LABEL = { landmark: '🏛 랜드마크', exp: '🎟 체험', meal: '🍽 맛집', cafe: '☕ 카페', stay: '🛏 숙박' };
+  var CUR_KIND_LABEL = { landmark: '🏛 랜드마크', exp: '🎟 체험', meal: '🍽 맛집', cafe: '☕ 카페', stay: '🛏 숙박 호텔' };
+  var CUR_SLOT_LABEL = { morning: '아침', lunch: '점심', afternoon: '오후', sunset: '선셋·야경', dinner: '저녁', night: '야간' };
+  var CUR_SLOT_START = { morning: 540, lunch: 720, afternoon: 840, sunset: 1050, dinner: 1140, night: 1230 };
+  var CUR_SLOT_END = { morning: 690, lunch: 870, afternoon: 1050, sunset: 1170, dinner: 1260, night: 1350 };
+  var CUR_SLOT_ORDER = { morning: 0, lunch: 1, afternoon: 2, sunset: 3, dinner: 4, night: 5 };
+  var CUR_BUF_SAME = 15;
+  var CUR_BUF_DIFF = 30;
+  var CUR_DAY_LIMIT = 7;
   var CUR_SKELETON = [
-    ['오전 명소 (자리표시자)', 'landmark', '추천 DB에 없는 도시 · 실제 장소명으로 수정하세요'],
-    ['점심 맛집 (자리표시자)', 'meal', '추천 DB에 없는 도시 · 실제 식당명으로 수정하세요'],
-    ['오후 명소 (자리표시자)', 'landmark', '추천 DB에 없는 도시 · 실제 장소명으로 수정하세요'],
-    ['카페 (자리표시자)', 'cafe', '추천 DB에 없는 도시 · 실제 카페명으로 수정하세요'],
-    ['저녁 식사 (자리표시자)', 'meal', '추천 DB에 없는 도시 · 실제 식당명으로 수정하세요'],
-    ['숙소 (자리표시자)', 'stay', '추천 DB에 없는 도시 · 실제 숙소명으로 수정하세요']
+    ['오전 명소 (자리표시자)', 'landmark', '중심', 90, 'morning', '추천 DB에 없는 도시 · 실제 장소명으로 수정하세요'],
+    ['점심 맛집 (자리표시자)', 'meal', '중심', 60, 'lunch', '추천 DB에 없는 도시 · 실제 식당명으로 수정하세요'],
+    ['오후 명소 (자리표시자)', 'landmark', '중심', 90, 'afternoon', '추천 DB에 없는 도시 · 실제 장소명으로 수정하세요'],
+    ['카페 (자리표시자)', 'cafe', '중심', 60, 'afternoon', '추천 DB에 없는 도시 · 실제 카페명으로 수정하세요'],
+    ['저녁 식사 (자리표시자)', 'meal', '중심', 60, 'dinner', '추천 DB에 없는 도시 · 실제 식당명으로 수정하세요'],
+    ['숙소 (자리표시자)', 'stay', '중심', 0, 'night', '추천 DB에 없는 도시 · 실제 숙소명으로 수정하세요']
   ];
 
   function curationFor(city) {
@@ -1825,14 +1832,35 @@
       return {
         country: rec.c || '',
         fallback: false,
-        list: rec.items.map(function (x) { return { name: x[0], kind: x[1], memo: x[2] || '' }; })
+        list: rec.items.map(function (x) {
+          return {
+            name: x[0],
+            kind: x[1],
+            zone: x[2] || '중심',
+            dur: Number(x[3]) || (x[1] === 'stay' ? 0 : 60),
+            slot: CUR_SLOT_LABEL[x[4]] ? x[4] : 'afternoon',
+            memo: x[5] || ''
+          };
+        })
       };
     }
     return {
       country: '',
       fallback: true,
-      list: CUR_SKELETON.map(function (x) { return { name: x[0], kind: x[1], memo: x[2] }; })
+      list: CUR_SKELETON.map(function (x) {
+        return { name: x[0], kind: x[1], zone: x[2], dur: x[3], slot: x[4], memo: x[5] };
+      })
     };
+  }
+
+  function curationZoneSummary(list) {
+    var order = [], count = {};
+    list.forEach(function (x) {
+      if (x.kind === 'stay') return;
+      if (!count[x.zone]) { count[x.zone] = 0; order.push(x.zone); }
+      count[x.zone]++;
+    });
+    return order.map(function (z) { return z + ' ' + count[z]; }).join(' · ');
   }
 
   function openCuration() {
@@ -1848,18 +1876,24 @@
         '<div class="cur-city-head">' +
           '<span class="cur-flag">' + codeOf(info.country || t.country) + '</span>' +
           '<strong>' + esc(city) + '</strong>' +
-          '<span class="cur-route">오전 → 점심 → 오후 → 카페 → 저녁</span>' +
+          '<span class="cur-route">' + info.list.length + '곳 · 권역 ' + Object.keys(info.list.reduce(function (m, x) { if (x.kind !== 'stay') m[x.zone] = 1; return m; }, {})).length + '</span>' +
         '</div>' +
         (info.fallback ? '<p class="cur-note">추천 DB에 없는 도시라 기본 골격(자리표시자)으로 채웁니다. 채운 뒤 ✏️ 수정으로 실제 장소를 입력하세요.</p>' : '') +
+        '<div class="cur-zones"><b>권역</b><span>' + esc(curationZoneSummary(info.list)) + '</span></div>' +
         kinds.map(function (kind) {
           var items = info.list.filter(function (x) { return x.kind === kind; });
           return '<div class="cur-group" data-city="' + esc(city) + '" data-kind="' + kind + '">' +
             '<div class="cur-group-head"><h3>' + CUR_KIND_LABEL[kind] + ' <small>' + items.length + '</small></h3>' +
               '<button type="button" class="cur-mini" data-action="cur-cat" data-city="' + esc(city) + '" data-kind="' + kind + '" aria-label="' + esc(city) + ' ' + esc(CUR_KIND_LABEL[kind]) + ' 전체 선택">카테고리 전체</button></div>' +
             items.map(function (it, i) {
+              var isStay = it.kind === 'stay';
+              var meta = isStay
+                ? '숙박 · ' + it.zone + ' 권역'
+                : it.zone + ' · 예상 ' + it.dur + '분 · ' + (CUR_SLOT_LABEL[it.slot] || '오후') + ' 추천';
               return '<label class="cur-item">' +
-                '<input type="checkbox" data-cur="' + esc(city + '||' + kind + '||' + i) + '" data-city="' + esc(city) + '" data-kind="' + kind + '" data-name="' + esc(it.name) + '" data-memo="' + esc(it.memo) + '" data-country="' + esc(info.country) + '"' + (info.fallback ? ' data-fallback="1"' : '') + ' checked>' +
+                '<input type="checkbox" data-cur="' + esc(city + '||' + kind + '||' + i) + '" data-city="' + esc(city) + '" data-kind="' + kind + '" data-name="' + esc(it.name) + '" data-memo="' + esc(it.memo) + '" data-zone="' + esc(it.zone) + '" data-dur="' + it.dur + '" data-slot="' + esc(it.slot) + '" data-country="' + esc(info.country) + '"' + (info.fallback ? ' data-fallback="1"' : '') + ' checked>' +
                 '<span class="cur-name">' + esc(it.name) + '</span>' +
+                '<span class="cur-meta">' + esc(meta) + '</span>' +
                 '<span class="cur-memo">' + esc(it.memo) + '</span>' +
               '</label>';
             }).join('') +
@@ -1869,7 +1903,7 @@
     }).join('');
 
     openModal(
-      modalHead('✨ 동선 추천 채우기', '선택한 항목을 도시별 동선(오전 → 점심 → 오후 → 카페 → 저녁)에 맞춰 일정·맛집·숙소에 자동 배치합니다.') +
+      modalHead('✨ 동선 추천 채우기', '같은 권역끼리 같은 날로 묶고, 체류 시간·이동 버퍼(같은 권역 15분·다른 권역 30분)까지 계산해 시작 시각이 겹치지 않게 배치합니다.') +
       '<div class="modal-body">' +
         '<div class="cur-bar">' +
           '<button type="button" class="btn btn-ghost btn-sm" data-action="cur-all">모두 선택</button>' +
@@ -1878,9 +1912,10 @@
         '</div>' +
         body +
         '<p class="hint">' + esc(CURATION_META.note || '실존 장소·권역 기준 추천입니다. 영업시간은 방문 전 지도에서 확인하세요.') + '</p>' +
+        '<p class="hint">숙박 호텔은 일정이 아니라 <b>정보 탭 숙소 카드</b>에 등록되고, 박 수에 맞춰 순서대로 배분됩니다.</p>' +
         '<div class="modal-actions">' +
           '<button type="button" class="btn btn-ghost" data-action="close-modal">취소</button>' +
-          '<button type="button" class="btn btn-primary" data-action="cur-apply">선택 항목으로 일정·맛집·숙소 채우기</button>' +
+          '<button type="button" class="btn btn-primary" data-action="cur-apply">선택 항목으로 일정 세팅하기</button>' +
         '</div>' +
       '</div>',
       true
@@ -1916,13 +1951,16 @@
         kind: b.dataset.kind,
         name: b.dataset.name,
         memo: b.dataset.memo,
+        zone: b.dataset.zone || '중심',
+        dur: Number(b.dataset.dur) || (b.dataset.kind === 'stay' ? 0 : 60),
+        slot: b.dataset.slot || 'afternoon',
         country: b.dataset.country,
         fallback: b.dataset.fallback === '1'
       });
     });
     if (!picked.length) { toast('채울 항목을 1개 이상 선택해 주세요'); return; }
 
-    var stats = { plan: 0, food: 0, lodging: 0, skip: 0 };
+    var stats = { plan: 0, food: 0, lodging: 0, skip: 0, zones: 0 };
     var cities = [];
     picked.forEach(function (p) { if (cities.indexOf(p.city) < 0) cities.push(p.city); });
     cities.forEach(function (city) {
@@ -1945,8 +1983,29 @@
     if (firstDay) ui.day = firstDay.n;
     render();
     window.scrollTo(0, 0);
-    toast('일정 ' + stats.plan + ' · 맛집 ' + stats.food + ' · 숙소 ' + stats.lodging + '개를 채웠어요' +
-      (stats.skip ? ' (이미 있는 ' + stats.skip + '개는 건너뜀)' : ''));
+    toast('일정 ' + stats.plan + ' · 맛집 ' + stats.food + ' · 숙소 ' + stats.lodging + '개 배치' +
+      (stats.zones ? ' · 권역 ' + stats.zones + '개 묶음' : '') +
+      (stats.skip ? ' (중복·시간초과 ' + stats.skip + '개 제외)' : ''));
+  }
+
+  /* 여행 첫날 도착·마지막날 출발 시각을 반영한 하루 가용 시간 창 */
+  function curationDayWindow(t, day) {
+    var start = 9 * 60;
+    var end = 21 * 60 + 30;
+    var first = t.days[0];
+    var last = t.days[t.days.length - 1];
+    if (first && day.n === first.n) {
+      var arr = t.outbound ? parseTime(t.outbound.arr) : null;
+      if (arr !== null && arr > 0) start = Math.max(8 * 60, arr + (isKorea(t.country) ? 45 : 90));
+    }
+    if (last && day.n === last.n) {
+      var dep = t.inbound ? parseTime(t.inbound.dep) : null;
+      if (dep !== null && dep > 0) {
+        end = Math.min(end, dep - (isKorea(t.country) ? 60 : 150));
+      }
+    }
+    if (end - start < 240) end = Math.min(23 * 60, start + 240);
+    return [start, end];
   }
 
   function fillCityCuration(t, city, entries, stats) {
@@ -1959,38 +2018,171 @@
       if (guess) days = [guess];
     }
     if (!days.length) return;
-    var busy = {};
-    days.forEach(function (d) { busy[d.n] = dayBusyRanges(d); });
-    var counters = { landmark: 0, meal: 0, cafe: 0 };
 
-    entries.forEach(function (e) {
-      var country = e.country || t.country;
-      if (e.kind === 'stay') { addCurationLodging(t, city, e, stats); return; }
-      var dup = false;
-      t.days.forEach(function (d) {
-        if (d.items.some(function (x) { return x.title === e.name; })) dup = true;
+    var country = (entries[0] && entries[0].country) || t.country;
+    var stays = entries.filter(function (e) { return e.kind === 'stay'; });
+    var acts = entries.filter(function (e) { return e.kind !== 'stay'; });
+
+    if (stays.length) addCurationLodging(t, city, stays, stats);
+    if (!acts.length) { touchTrip(t); return; }
+
+    acts = acts.filter(function (e) {
+      var dup = t.days.some(function (d) {
+        return d.items.some(function (x) { return x.title === e.name; });
       });
-      if (dup) { stats.skip++; return; }
-      var slot = nextCurationSlot(days, busy, e.kind, counters);
-      if (!slot) { stats.skip++; return; }
-      var category = e.kind === 'meal' ? '식사' : e.kind === 'cafe' ? '카페' : (e.kind === 'exp' ? '체험' : '핵심');
-      slot.day.items.push({
-        id: uid('it'),
-        time: slot.time,
-        title: e.name,
-        category: category,
-        city: city,
-        place: e.fallback ? '' : e.name,
-        memo: e.memo,
-        country: country,
-        from: '', to: '', fromCountry: '', toCountry: '', mode: '', arr: '', leg: '',
-        src: e.fallback ? 'skeleton' : 'curation'
+      if (dup) { stats.skip++; return false; }
+      return true;
+    });
+    if (!acts.length) return;
+
+    var windows = {};
+    var occupied = {};
+    days.forEach(function (d) {
+      windows[d.n] = curationDayWindow(t, d);
+      occupied[d.n] = dayBusyRanges(d);
+    });
+
+    function overlaps(ranges, s, e) {
+      return ranges.some(function (r) { return s < r[1] && e > r[0]; });
+    }
+    function tryPlace(d, e, from) {
+      var win = windows[d.n];
+      var slotMin = CUR_SLOT_START[e.slot] == null ? win[0] : CUR_SLOT_START[e.slot];
+      var slotMax = CUR_SLOT_END[e.slot] == null ? win[1] : CUR_SLOT_END[e.slot];
+      var limit = Math.min(win[1], slotMax);
+      var start = Math.max(from, Math.max(slotMin, win[0]));
+      start = Math.ceil(start / 5) * 5;
+      var need = Math.max(20, e.dur);
+      for (var k = 0; k < 42; k++) {
+        var end = start + need;
+        if (end > limit) return null;
+        if (!overlaps(occupied[d.n], start, end)) {
+          return start;
+        }
+        start += 10;
+      }
+      return null;
+    }
+
+    /* 1) 권역 클러스터링 — 같은 zone은 같은 날에 통째로 배정 */
+    var zoneOrder = [];
+    var zoneMap = {};
+    acts.forEach(function (e) {
+      var z = e.zone || '중심';
+      if (!zoneMap[z]) { zoneMap[z] = []; zoneOrder.push(z); }
+      zoneMap[z].push(e);
+    });
+    function zoneLoad(arr) {
+      return arr.reduce(function (s, e) { return s + Math.max(30, e.dur) + CUR_BUF_SAME; }, 0);
+    }
+    zoneOrder.sort(function (a, b) {
+      return zoneLoad(zoneMap[b]) - zoneLoad(zoneMap[a]) || String(a).localeCompare(String(b));
+    });
+
+    var load = {};
+    days.forEach(function (d) {
+      load[d.n] = { zones: [], used: 0, cap: Math.max(240, windows[d.n][1] - windows[d.n][0]) };
+    });
+    var maxZonesPerDay = Math.max(1, Math.ceil(zoneOrder.length / Math.max(1, days.length)));
+    zoneOrder.forEach(function (z) {
+      var need = zoneLoad(zoneMap[z]);
+      var pick = null, best = -Infinity;
+      days.forEach(function (d) {
+        var L = load[d.n];
+        if (L.zones.length >= maxZonesPerDay) return;
+        var remain = L.cap - L.used - (L.zones.length ? 150 : 0);
+        if (remain >= need && remain > best) { best = remain; pick = d; }
       });
-      slot.day.items.sort(sortByTime);
-      stats.plan++;
-      if (e.kind === 'meal' || e.kind === 'cafe') addCurationFood(t, city, e, country, stats);
+      if (!pick) {
+        best = -Infinity;
+        days.forEach(function (d) {
+          var remain = load[d.n].cap - load[d.n].used;
+          if (remain > best) { best = remain; pick = d; }
+        });
+      }
+      if (!pick) pick = days[0];
+      load[pick.n].zones.push(z);
+      load[pick.n].used += need;
+      stats.zones = (stats.zones || 0) + 1;
+    });
+
+    /* 2) 하루 안에서 시간대 순서로 배치 + 이동 버퍼 계산 */
+    var overflow = [];
+    var dayPlaced = {};
+    days.forEach(function (d) {
+      var L = load[d.n];
+      if (!L.zones.length) return;
+      var pool = [];
+      L.zones.forEach(function (z) { pool = pool.concat(zoneMap[z]); });
+      var zoneRank = {};
+      L.zones.forEach(function (z, zi) { zoneRank[z] = zi; });
+      pool.sort(function (a, b) {
+        var sa = CUR_SLOT_ORDER[a.slot] == null ? 2 : CUR_SLOT_ORDER[a.slot];
+        var sb = CUR_SLOT_ORDER[b.slot] == null ? 2 : CUR_SLOT_ORDER[b.slot];
+        return sa - sb || (zoneRank[a.zone] || 0) - (zoneRank[b.zone] || 0) || b.dur - a.dur;
+      });
+      var cursor = windows[d.n][0];
+      var prevZone = '';
+      var placedCount = 0;
+      pool.forEach(function (e) {
+        if (placedCount >= CUR_DAY_LIMIT) { overflow.push(e); return; }
+        var buffer = prevZone ? (prevZone === e.zone ? CUR_BUF_SAME : CUR_BUF_DIFF) : 0;
+        var placed = tryPlace(d, e, cursor + buffer);
+        if (placed === null) { overflow.push(e); return; }
+        occupied[d.n].push([placed, placed + Math.max(20, e.dur)]);
+        pushCurationItem(t, d, e, placed, city, country);
+        cursor = Math.max(cursor, placed + Math.max(20, e.dur));
+        prevZone = e.zone;
+        placedCount++;
+        dayPlaced[d.n] = (dayPlaced[d.n] || 0) + 1;
+        stats.plan++;
+        if (e.kind === 'meal' || e.kind === 'cafe') addCurationFood(t, city, e, country, stats);
+      });
+    });
+
+    /* 3) 넘친 항목은 다른 날 빈 시간에 재배치 */
+    overflow.forEach(function (e) {
+      var ordered = days.slice().sort(function (a, b) {
+        var za = load[a.n].zones.indexOf(e.zone) >= 0 ? 0 : 1;
+        var zb = load[b.n].zones.indexOf(e.zone) >= 0 ? 0 : 1;
+        return za - zb || a.n - b.n;
+      });
+      for (var i = 0; i < ordered.length; i++) {
+        var d = ordered[i];
+        if ((dayPlaced[d.n] || 0) >= CUR_DAY_LIMIT) continue;
+        if (load[d.n].zones.length >= maxZonesPerDay + 1 && load[d.n].zones.indexOf(e.zone) < 0) continue;
+        var placed = tryPlace(d, e, windows[d.n][0]);
+        if (placed !== null) {
+          occupied[d.n].push([placed, placed + Math.max(20, e.dur)]);
+          if (load[d.n].zones.indexOf(e.zone) < 0) load[d.n].zones.push(e.zone);
+          pushCurationItem(t, d, e, placed, city, country);
+          dayPlaced[d.n] = (dayPlaced[d.n] || 0) + 1;
+          stats.plan++;
+          if (e.kind === 'meal' || e.kind === 'cafe') addCurationFood(t, city, e, country, stats);
+          return;
+        }
+      }
+      stats.skip++;
     });
     touchTrip(t);
+  }
+
+  function pushCurationItem(t, d, e, startMin, city, country) {
+    var category = e.kind === 'meal' ? '식사' : e.kind === 'cafe' ? '카페' : (e.kind === 'exp' ? '체험' : '핵심');
+    var memo = '[' + (e.zone || '중심') + '] ' + (e.memo || '') + ' · 예상 ' + e.dur + '분';
+    d.items.push({
+      id: uid('it'),
+      time: fmtTime(startMin),
+      title: e.name,
+      category: category,
+      city: city,
+      place: e.fallback ? '' : e.name,
+      memo: memo,
+      country: country,
+      from: '', to: '', fromCountry: '', toCountry: '', mode: '', arr: '', leg: '',
+      src: e.fallback ? 'skeleton' : 'curation'
+    });
+    d.items.sort(sortByTime);
   }
 
   function dayBusyRanges(d) {
@@ -2002,39 +2194,9 @@
       var arr = x.arr ? parseTime(x.arr) : null;
       if (arr !== null && arr > s) e = Math.max(e, arr + 30);
       if (x.leg === 'inbound') e = 24 * 60;
-      ranges.push([s, e]);
+      ranges.push([Math.min(s, 24 * 60), Math.min(e, 24 * 60)]);
     });
     return ranges;
-  }
-
-  function slotFree(ranges, mins) {
-    var end = mins + 75;
-    return !ranges.some(function (r) { return mins < r[1] && end > r[0]; });
-  }
-
-  function nextCurationSlot(days, busy, kind, counters) {
-    var key = (kind === 'exp') ? 'landmark' : kind;
-    var times = key === 'cafe' ? [990] : key === 'meal' ? [750, 1155] : [570, 900];
-    var start = counters[key] || 0;
-    var total = days.length * times.length;
-    for (var i = start; i < total; i++) {
-      var d = days[Math.floor(i / times.length)];
-      var mins = times[i % times.length];
-      if (!d) continue;
-      if (slotFree(busy[d.n], mins)) {
-        counters[key] = i + 1;
-        busy[d.n].push([mins, mins + 75]);
-        return { day: d, time: fmtTime(mins) };
-      }
-    }
-    var last = days[days.length - 1];
-    for (var m = 480; m <= 1290; m += 30) {
-      if (slotFree(busy[last.n], m)) {
-        busy[last.n].push([m, m + 75]);
-        return { day: last, time: fmtTime(m) };
-      }
-    }
-    return null;
   }
 
   function foodTypeFor(country, kind) {
@@ -2054,22 +2216,30 @@
       name: e.name,
       type: foodTypeFor(country, e.kind),
       hours: '',
-      memo: e.memo,
+      memo: '[' + (e.zone || '중심') + '] ' + (e.memo || '') + ' · 예상 ' + e.dur + '분',
       city: city
     });
     stats.food++;
   }
 
-  function addCurationLodging(t, city, e, stats) {
-    if (t.info.lodging.some(function (l) { return l.name === e.name; })) { stats.skip++; return; }
-    t.info.lodging.push({
-      id: uid('lg'), name: e.name, address: '', checkin: '15:00', checkout: '11:00', phone: '', city: city
+  function addCurationLodging(t, city, stays, stats) {
+    var cityDays = t.days.filter(function (d) { return d.city === city; }).length;
+    var nights = Math.max(1, (cityDays || t.days.length) - 1);
+    var per = Math.max(1, Math.floor(nights / Math.max(1, stays.length)));
+    stays.forEach(function (e, i) {
+      if (t.info.lodging.some(function (l) { return l.name === e.name; })) { stats.skip++; return; }
+      t.info.lodging.push({
+        id: uid('lg'), name: e.name, address: '', checkin: '15:00', checkout: '11:00', phone: '', city: city
+      });
+      var from = i * per + 1;
+      var to = i === stays.length - 1 ? nights : Math.min(nights, (i + 1) * per);
+      var nightLabel = nights >= stays.length ? (stays.length === 1 ? nights + '박' : from + '~' + to + '박차')
+        : '후보 ' + (i + 1);
+      var line = '숙소 · ' + city + ': ' + e.name + (e.memo ? ' (' + e.memo + ')' : '') +
+        ' · ' + nightLabel + ' · 체크인 15:00 · 체크아웃 11:00';
+      if (t.info.memo.indexOf(e.name) < 0) t.info.memo = (t.info.memo ? t.info.memo + '\n' : '') + line;
+      stats.lodging++;
     });
-    if (t.info.memo.indexOf(e.name) < 0) {
-      var line = '숙소 · ' + city + ': ' + e.name + (e.memo ? ' (' + e.memo + ')' : '') + ' · 체크인 15:00 · 체크아웃 11:00';
-      t.info.memo = (t.info.memo ? t.info.memo + '\n' : '') + line;
-    }
-    stats.lodging++;
   }
 
   /* ---------- schedule item modal ---------- */
