@@ -5,6 +5,7 @@
 - 라이브 구조: `index.html` + `styles.css` + `app.js` (빌드 없음, 순수 정적 파일)
 - 저장: 브라우저 `localStorage` (기기 안에서 완결)
 - 배포: GitHub Pages / Vercel / Netlify 등 정적 호스팅 아무 곳이나 가능
+- 상단 **🏠 나의 여행 지도 홈** 버튼: 허브 포털(`https://my-travel-map-kohl.vercel.app/`)로 **같은 탭에서** 이동(새 탭 없음)
 
 ## 바로 쓰기
 
