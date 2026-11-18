@@ -43,8 +43,13 @@
     '이동': { cls: 'c-move', emoji: '🚇', color: '#2A5FA8' },
     '식사': { cls: 'c-meal', emoji: '🍽', color: '#B87A16' },
     '카페': { cls: 'c-cafe', emoji: '☕', color: '#8A5A3B' },
-    '체험': { cls: 'c-exp', emoji: '🎟', color: '#6B4BA8' }
+    '체험': { cls: 'c-exp', emoji: '🎟', color: '#6B4BA8' },
+    '숙박': { cls: 'c-stay', emoji: '🛏', color: '#2F6F66' }
   };
+
+  /* 숙소 체크인·체크아웃 기본 시각 */
+  var STAY_DEFAULT_IN = '15:00';
+  var STAY_DEFAULT_OUT = '11:00';
 
   var CHECK_GROUPS = ['필수 서류', '전자기기', '의류·세면', '건강·상비약', '기타'];
   var BUDGET_CATS = ['교통', '숙박', '식비', '관광', '쇼핑', '기타'];
@@ -384,7 +389,9 @@
       leg: leg,
       lat: raw.lat === 0 || raw.lat ? raw.lat : '',
       lon: raw.lon === 0 || raw.lon ? raw.lon : '',
-      src: String(raw.src || '')
+      src: String(raw.src || ''),
+      autoKind: (raw.autoKind === 'stay-checkin' || raw.autoKind === 'stay-checkout') ? raw.autoKind : '',
+      staySegId: String(raw.staySegId || '')
     };
   }
 
@@ -541,12 +548,35 @@
         id: l.id || uid('lg'),
         name: String(l.name || ''),
         address: String(l.address || ''),
-        checkin: String(l.checkin || ''),
-        checkout: String(l.checkout || ''),
+        checkin: parseTime(l.checkin) === null ? '' : String(l.checkin),
+        checkout: parseTime(l.checkout) === null ? '' : String(l.checkout),
         phone: String(l.phone || ''),
-        city: String(l.city || '')
+        city: String(l.city || ''),
+        zone: String(l.zone || ''),
+        memo: String(l.memo || ''),
+        lat: l.lat === 0 || l.lat ? l.lat : '',
+        lon: l.lon === 0 || l.lon ? l.lon : '',
+        src: String(l.src || '')
       };
     }).filter(function (l) { return l.name; });
+    /* 숙박 구간(숙소별 체크인~체크아웃). 체크인/체크아웃이 모두 있는 구간만 유지 */
+    t.info.stayPlan = list(info.stayPlan).map(function (s) {
+      if (!s || typeof s !== 'object') return null;
+      var ci = String(s.checkinDate || ''), co = String(s.checkoutDate || '');
+      if (!parseISO(ci) || !parseISO(co) || co <= ci) return null;
+      return {
+        id: s.id || uid('sp'),
+        lodgingId: String(s.lodgingId || ''),
+        name: String(s.name || ''),
+        city: String(s.city || ''),
+        checkinDate: ci,
+        checkinTime: parseTime(s.checkinTime) === null ? STAY_DEFAULT_IN : String(s.checkinTime),
+        checkoutDate: co,
+        checkoutTime: parseTime(s.checkoutTime) === null ? STAY_DEFAULT_OUT : String(s.checkoutTime),
+        hideCheckin: !!s.hideCheckin,
+        hideCheckout: !!s.hideCheckout
+      };
+    }).filter(Boolean);
     t.info.emergency = list(info.emergency).map(function (e) {
       return { id: e.id || uid('em'), name: String(e.name || ''), number: String(e.number || '') };
     }).filter(function (e) { return e.name && e.number; });
@@ -834,6 +864,220 @@
     var m = mapInfo(t, o);
     var name = o.place || o.name || o.title || '';
     return '<a class="place-link" href="' + esc(m.url) + '" target="_blank" rel="noopener noreferrer">📍 ' + esc(name) + '</a>';
+  }
+
+  /* ---------- 숙소 계획 (비교·선택 → 체크인/체크아웃 일정 자동 반영) ---------- */
+  function lodgingById(t, id) {
+    if (!t || !id) return null;
+    return list(t.info.lodging).filter(function (l) { return l.id === id; })[0] || null;
+  }
+
+  /* 숙박일(밤) 목록 — DAY 1 밤 ~ 마지막 전날 밤 */
+  function stayNights(t) {
+    var days = list(t && t.days), out = [];
+    for (var i = 0; i < days.length - 1; i++) {
+      out.push({ n: i + 1, dayN: days[i].n, date: days[i].date, city: days[i].city || '' });
+    }
+    return out;
+  }
+
+  function stayDayByDate(t, iso) {
+    return list(t && t.days).filter(function (d) { return d.date === iso; })[0] || null;
+  }
+
+  /* 날짜(밤) → 그 밤을 담당하는 숙박 구간 */
+  function stayNightSegmentMap(t) {
+    var map = {};
+    list(t && t.info && t.info.stayPlan).forEach(function (seg) {
+      var d = seg.checkinDate, guard = 0;
+      while (d && d < seg.checkoutDate && guard < 400) {
+        map[d] = seg;
+        d = addDaysISO(d, 1);
+        guard++;
+      }
+    });
+    return map;
+  }
+
+  function staySegNights(seg) {
+    return Math.max(1, dayCount(seg.checkinDate, seg.checkoutDate) - 1);
+  }
+
+  function stayAssignedNights(t) {
+    var map = stayNightSegmentMap(t);
+    return stayNights(t).filter(function (n) { return !!map[n.date]; }).length;
+  }
+
+  /* 밤별 숙소 id 맵 → 연속된 같은 숙소를 하나의 체크인~체크아웃 구간으로 재구성 */
+  function rebuildStayPlan(t, nightIds) {
+    var prev = list(t.info.stayPlan).slice();
+    var out = [];
+    var cur = null;
+    stayNights(t).forEach(function (nt) {
+      var lid = nightIds[nt.date] || '';
+      if (!lid) { cur = null; return; }
+      var lod = lodgingById(t, lid);
+      if (!lod) { cur = null; return; }
+      if (cur && cur.lodgingId === lid) { cur.checkoutDate = addDaysISO(nt.date, 1); return; }
+      var sameDay = prev.filter(function (p) { return p.checkinDate === nt.date; })[0];
+      var anySame = prev.filter(function (p) { return p.lodgingId === lid; })[0];
+      cur = {
+        id: sameDay ? sameDay.id : uid('sp'),
+        lodgingId: lid,
+        name: lod.name,
+        city: lod.city || nt.city,
+        checkinDate: nt.date,
+        checkinTime: sameDay ? sameDay.checkinTime
+          : (anySame ? anySame.checkinTime : (parseTime(lod.checkin) === null ? STAY_DEFAULT_IN : lod.checkin)),
+        checkoutDate: addDaysISO(nt.date, 1),
+        checkoutTime: anySame ? anySame.checkoutTime
+          : (parseTime(lod.checkout) === null ? STAY_DEFAULT_OUT : lod.checkout),
+        hideCheckin: sameDay ? !!sameDay.hideCheckin : false,
+        hideCheckout: false
+      };
+      out.push(cur);
+    });
+    /* 같은 숙소로 다시 합쳐졌을 때 사용자가 고친 체크아웃 시각 유지 */
+    out.forEach(function (seg) {
+      var hit = prev.filter(function (p) {
+        return p.lodgingId === seg.lodgingId && p.checkoutDate === seg.checkoutDate;
+      })[0];
+      if (!hit) return;
+      if (parseTime(hit.checkoutTime) !== null) seg.checkoutTime = hit.checkoutTime;
+      seg.hideCheckout = !!hit.hideCheckout;
+    });
+    t.info.stayPlan = out;
+    return out;
+  }
+
+  function assignStayNight(t, date, lodgingId) {
+    var map = stayNightSegmentMap(t);
+    var ids = {};
+    stayNights(t).forEach(function (n) { ids[n.date] = map[n.date] ? map[n.date].lodgingId : ''; });
+    if (!(date in ids)) return false;
+    ids[date] = String(lodgingId || '');
+    rebuildStayPlan(t, ids);
+    return true;
+  }
+
+  function assignAllStayNights(t, lodgingId) {
+    var ids = {};
+    stayNights(t).forEach(function (n) { ids[n.date] = String(lodgingId || ''); });
+    rebuildStayPlan(t, ids);
+  }
+
+  function clearStaySegment(t, seg) {
+    if (!t || !seg) return;
+    var map = stayNightSegmentMap(t), ids = {};
+    stayNights(t).forEach(function (n) {
+      ids[n.date] = (map[n.date] && map[n.date].id === seg.id) ? '' : (map[n.date] ? map[n.date].lodgingId : '');
+    });
+    rebuildStayPlan(t, ids);
+  }
+
+  /* 구간의 체크인/체크아웃 날짜 변경 — 밤 배정을 다시 계산해 한 곳(밤 맵)에서만 관리 */
+  function setStaySegmentDate(t, seg, kind, value) {
+    if (!t || !seg || !value) return false;
+    var map = stayNightSegmentMap(t), ids = {};
+    stayNights(t).forEach(function (n) { ids[n.date] = map[n.date] ? map[n.date].lodgingId : ''; });
+    var d, guard = 0;
+    if (kind === 'checkin') {
+      var end = seg.checkoutDate > value ? seg.checkoutDate : addDaysISO(value, 1);
+      Object.keys(map).forEach(function (date) {
+        if (map[date].id === seg.id && date < value) ids[date] = '';
+      });
+      d = value;
+      while (d < end && guard++ < 400) {
+        if (d in ids) ids[d] = seg.lodgingId;
+        d = addDaysISO(d, 1);
+      }
+    } else {
+      if (value <= seg.checkinDate) return false;
+      Object.keys(map).forEach(function (date) {
+        if (map[date].id === seg.id && date >= value) ids[date] = '';
+      });
+      d = seg.checkinDate;
+      while (d < value && guard++ < 400) {
+        if (d in ids) ids[d] = seg.lodgingId;
+        d = addDaysISO(d, 1);
+      }
+    }
+    rebuildStayPlan(t, ids);
+    return true;
+  }
+
+  function stayItemFor(t, seg, kind, day) {
+    var lod = lodgingById(t, seg.lodgingId);
+    var name = (lod && lod.name) || seg.name || '숙소';
+    var isIn = kind === 'stay-checkin';
+    var bits = [];
+    if (isIn) bits.push(staySegNights(seg) + '박');
+    if (lod && lod.address) bits.push(lod.address);
+    if (lod && lod.phone) bits.push('☎ ' + lod.phone);
+    return {
+      id: uid('it'),
+      time: isIn ? seg.checkinTime : seg.checkoutTime,
+      title: name + (isIn ? ' 체크인' : ' 체크아웃'),
+      category: '숙박',
+      city: (lod && lod.city) || seg.city || (day && day.city) || '',
+      place: name,
+      memo: bits.join(' · '),
+      country: '',
+      from: '', to: '', fromCountry: '', toCountry: '', mode: '', arr: '', leg: '',
+      lat: lod && lod.lat !== '' && lod.lat !== undefined ? lod.lat : '',
+      lon: lod && lod.lon !== '' && lod.lon !== undefined ? lod.lon : '',
+      src: 'stay-plan',
+      autoKind: kind,
+      staySegId: seg.id
+    };
+  }
+
+  /* 자동 생성 숙소 일정만 지우고 다시 만든다(중복 생성 없음) */
+  function syncStayItems(t) {
+    if (!t || !list(t.days).length) return { removed: 0, added: 0 };
+    var removed = 0;
+    t.days.forEach(function (d) {
+      d.items = d.items.filter(function (x) {
+        if (x.autoKind === 'stay-checkin' || x.autoKind === 'stay-checkout') { removed++; return false; }
+        return true;
+      });
+    });
+    var added = 0;
+    list(t.info.stayPlan).forEach(function (seg) {
+      if (!seg.hideCheckin) {
+        var d1 = stayDayByDate(t, seg.checkinDate);
+        if (d1) { d1.items.push(stayItemFor(t, seg, 'stay-checkin', d1)); added++; }
+      }
+      if (!seg.hideCheckout) {
+        var d2 = stayDayByDate(t, seg.checkoutDate);
+        if (d2) { d2.items.push(stayItemFor(t, seg, 'stay-checkout', d2)); added++; }
+      }
+    });
+    t.days.forEach(function (d) { d.items.sort(sortByTime); });
+    return { removed: removed, added: added };
+  }
+
+  function commitStay(t, msg) {
+    var r = syncStayItems(t);
+    touchTrip(t);
+    save();
+    render();
+    if (msg) toast(msg + (r.added ? ' · 일정 ' + r.added + '건 반영' : ''));
+  }
+
+  /* 여행 기간이 바뀌거나 동기화로 데이터가 들어왔을 때 구간을 여행 범위에 맞춘다 */
+  function reconcileStay(t) {
+    if (!t) return;
+    var dates = {};
+    list(t.days).forEach(function (d) { dates[d.date] = 1; });
+    t.info.stayPlan = list(t.info.stayPlan).filter(function (seg) {
+      return dates[seg.checkinDate] && stayDayByDate(t, seg.checkoutDate) && lodgingById(t, seg.lodgingId);
+    });
+    syncStayItems(t);
+  }
+
+  function reconcileStayPlans() {
+    list(state && state.trips).forEach(reconcileStay);
   }
 
   /* ---------- budget ---------- */
@@ -1305,29 +1549,184 @@
   }
 
   /* ---------- view: 정보 ---------- */
+  function stayCityGroups(t) {
+    var groups = [];
+    list(t.info.lodging).forEach(function (l) {
+      var c = l.city || (t.cities[0] || '');
+      var g = groups.filter(function (x) { return x.city === c; })[0];
+      if (!g) { g = { city: c, items: [] }; groups.push(g); }
+      g.items.push(l);
+    });
+    var order = t.cities.slice();
+    groups.sort(function (a, b) {
+      var ia = order.indexOf(a.city), ib = order.indexOf(b.city);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
+    return groups;
+  }
+
+  function stayOptionsHtml(t, curId, cityFirst, alwaysCity) {
+    var groups = stayCityGroups(t);
+    if (cityFirst) {
+      groups = groups.slice().sort(function (a, b) {
+        return (a.city === cityFirst ? 0 : 1) - (b.city === cityFirst ? 0 : 1);
+      });
+    }
+    return groups.map(function (g) {
+      return '<optgroup label="' + esc(g.city || '기타') + '">' + g.items.map(function (l) {
+        var showCity = alwaysCity || (cityFirst && g.city !== cityFirst);
+        return '<option value="' + esc(l.id) + '"' + (l.id === curId ? ' selected' : '') + '>' + esc(l.name) +
+          (showCity && g.city ? ' · ' + esc(g.city) : '') + '</option>';
+      }).join('') + '</optgroup>';
+    }).join('');
+  }
+
+  function stayCardHtml(t, l, nights, segMap) {
+    var mine = nights.filter(function (n) {
+      var s = segMap[n.date];
+      return s && s.lodgingId === l.id;
+    });
+    var chips = nights.map(function (n) {
+      var s = segMap[n.date];
+      var on = !!(s && s.lodgingId === l.id);
+      return '<button type="button" class="sn-chip' + (on ? ' on' : '') + '" data-action="stay-night-toggle" data-date="' + esc(n.date) +
+        '" data-lodging="' + esc(l.id) + '" aria-pressed="' + (on ? 'true' : 'false') + '" title="' +
+        esc('DAY ' + n.dayN + ' 밤 · ' + fullDateLabel(n.date) + ' · ' + n.city) + '">DAY ' + n.dayN + '</button>';
+    }).join('');
+    var sub = [l.city, l.zone].filter(Boolean).join(' · ');
+    return '<article class="sc-card' + (mine.length ? ' on' : '') + '">' +
+      '<div class="sc-top"><h4>' + esc(l.name) + '</h4>' +
+        (mine.length ? '<span class="sc-count">' + mine.length + '박</span>' : '') + '</div>' +
+      (sub ? '<p class="sc-sub">' + esc(sub) + '</p>' : '') +
+      (l.memo ? '<p class="sc-memo">' + esc(l.memo) + '</p>' : '') +
+      (l.address ? '<p class="sc-meta">' + esc(l.address) + '</p>' : '') +
+      (l.phone ? '<p class="sc-meta muted">☎ ' + esc(l.phone) + '</p>' : '') +
+      '<div class="sc-nights"><span class="sc-nlb">박 지정</span>' + chips + '</div>' +
+      '<div class="sc-actions">' +
+        mapAnchor(t, { city: l.city || (t.cities[0] || ''), place: l.address || l.name, country: t.country }, '지도') +
+        '<button type="button" class="icon-btn" data-action="edit-lodging" data-id="' + l.id + '" aria-label="숙소 수정">' + ICONS.edit + '</button>' +
+        '<button type="button" class="icon-btn danger" data-action="del-lodging" data-id="' + l.id + '" aria-label="숙소 삭제">' + ICONS.trash + '</button>' +
+      '</div></article>';
+  }
+
+  function stayNightRowsHtml(t, nights, segMap) {
+    return '<div class="stay-nights">' +
+      '<div class="sn-title"><b>박별 숙소 배정</b><span>체크인 날짜 기준</span></div>' +
+      nights.map(function (n) {
+        var s = segMap[n.date];
+        var cur = s ? s.lodgingId : '';
+        return '<div class="sn-row">' +
+          '<div class="sn-day"><b>DAY ' + n.dayN + ' 밤</b><small>' + esc(dateLabel(n.date)) + ' · ' + esc(n.city) + '</small></div>' +
+          '<select class="sn-select" data-change="stay-night" data-date="' + esc(n.date) + '" aria-label="DAY ' + n.dayN + ' 밤 숙소 선택">' +
+            '<option value=""' + (cur ? '' : ' selected') + '>미배정</option>' + stayOptionsHtml(t, cur, n.city) +
+          '</select>' +
+        '</div>';
+      }).join('') +
+    '</div>';
+  }
+
+  function staySegmentsHtml(t, nights) {
+    var segs = list(t.info.stayPlan).slice().sort(function (a, b) {
+      return a.checkinDate < b.checkinDate ? -1 : a.checkinDate > b.checkinDate ? 1 : 0;
+    });
+    var head = '<div class="sp-title"><b>체크인 · 체크아웃 일정</b><span>' + segs.length + '개 구간</span></div>';
+    if (!segs.length) {
+      return '<div class="stay-plan">' + head +
+        '<p class="hint">위에서 밤마다 숙소를 고르면 여기에 체크인·체크아웃 시간이 만들어지고, <b>일정</b> 탭에 자동으로 들어갑니다.</p></div>';
+    }
+    var dayOpts = function (cur) {
+      return t.days.map(function (d) {
+        return '<option value="' + esc(d.date) + '"' + (d.date === cur ? ' selected' : '') + '>DAY ' + d.n + ' · ' + esc(dateLabel(d.date)) + '</option>';
+      }).join('');
+    };
+    var cards = segs.map(function (seg) {
+      var lod = lodgingById(t, seg.lodgingId);
+      var nm = (lod && lod.name) || seg.name;
+      return '<article class="sp-card" data-seg="' + esc(seg.id) + '">' +
+        '<div class="sp-top"><b>' + esc(nm) + '</b>' +
+          '<span class="sp-badge">' + staySegNights(seg) + '박</span>' +
+          (lod && lod.city ? '<span class="city-badge">' + esc(lod.city) + '</span>' : '') + '</div>' +
+        '<div class="sp-fields">' +
+          '<label class="sp-field"><span>체크인</span>' +
+            '<select data-change="stay-seg-date" data-seg="' + esc(seg.id) + '" data-kind="checkin" aria-label="체크인 날짜">' + dayOpts(seg.checkinDate) + '</select>' +
+            '<input type="time" value="' + esc(seg.checkinTime) + '" data-change="stay-seg-time" data-seg="' + esc(seg.id) + '" data-kind="checkin" aria-label="체크인 시간">' +
+          '</label>' +
+          '<label class="sp-field"><span>체크아웃</span>' +
+            '<select data-change="stay-seg-date" data-seg="' + esc(seg.id) + '" data-kind="checkout" aria-label="체크아웃 날짜">' + dayOpts(seg.checkoutDate) + '</select>' +
+            '<input type="time" value="' + esc(seg.checkoutTime) + '" data-change="stay-seg-time" data-seg="' + esc(seg.id) + '" data-kind="checkout" aria-label="체크아웃 시간">' +
+          '</label>' +
+        '</div>' +
+        '<div class="sp-actions">' +
+          mapAnchor(t, { city: (lod && lod.city) || seg.city, place: (lod && lod.address) || nm, country: t.country }, '지도') +
+          (seg.hideCheckin ? '<button type="button" class="btn btn-ghost btn-sm" data-action="stay-unhide" data-seg="' + esc(seg.id) + '" data-kind="checkin">체크인 다시 넣기</button>' : '') +
+          (seg.hideCheckout ? '<button type="button" class="btn btn-ghost btn-sm" data-action="stay-unhide" data-seg="' + esc(seg.id) + '" data-kind="checkout">체크아웃 다시 넣기</button>' : '') +
+          '<button type="button" class="btn btn-ghost btn-sm" data-action="stay-seg-del" data-seg="' + esc(seg.id) + '">구간 해제</button>' +
+        '</div>' +
+      '</article>';
+    }).join('');
+    return '<div class="stay-plan">' + head + cards +
+      '<p class="hint">저장하면 <b>일정</b> 탭의 체크인·체크아웃 카드가 시간순으로 다시 정렬됩니다. 같은 숙소로 이어지면 중복 없이 한 구간으로 합쳐집니다.</p></div>';
+  }
+
+  function staySectionHtml(t) {
+    var nights = stayNights(t);
+    var segMap = stayNightSegmentMap(t);
+    var lodging = list(t.info.lodging);
+    var assigned = stayAssignedNights(t);
+    var head = '<div class="section-head"><div><h2>숙소 비교 · 선택</h2><p>추천 숙소를 비교해 밤마다 고르면 체크인·체크아웃이 일정에 자동 반영됩니다</p></div>' +
+      '<div class="head-actions">' +
+        '<button type="button" class="btn btn-soft btn-sm" data-action="stay-recommend">✨ 추천 숙소</button>' +
+        '<button type="button" class="btn btn-soft btn-sm" data-action="add-lodging">+ 숙소</button>' +
+      '</div></div>';
+
+    if (!nights.length) {
+      return '<section class="panel stay-panel">' + head +
+        '<div class="empty-card" style="margin-top:8px"><span class="em">🛏</span><h3>1박 이상 여행에서 숙소를 고를 수 있어요</h3>' +
+        '<p>여행 기간을 늘리면 DAY별로 숙소를 배정하고<br>체크인·체크아웃을 일정에 넣을 수 있습니다.</p></div>' +
+      '</section>';
+    }
+
+    var summary = '<div class="stay-sum">' +
+      '<span class="ss-item"><b>' + nights.length + '박 ' + t.days.length + '일</b><small>숙박 일정</small></span>' +
+      '<span class="ss-item"><b>' + assigned + ' / ' + nights.length + '박</b><small>숙소 배정</small></span>' +
+      '<span class="ss-item"><b>' + list(t.info.stayPlan).length + '</b><small>체크인 구간</small></span>' +
+    '</div>';
+
+    if (!lodging.length) {
+      return '<section class="panel stay-panel">' + head + summary +
+        '<div class="empty-card" style="margin-top:10px"><span class="em">🛏</span><h3>비교할 숙소가 없어요</h3>' +
+        '<p>여행 도시의 추천 숙소를 한 번에 담아 비교하거나,<br>직접 예약한 숙소를 추가해 보세요.</p>' +
+        '<div class="empty-actions">' +
+          '<button type="button" class="btn btn-primary" data-action="stay-recommend">✨ 추천 숙소 불러오기</button>' +
+          '<button type="button" class="btn btn-soft" data-action="add-lodging">+ 숙소 직접 추가</button>' +
+        '</div></div></section>';
+    }
+
+    var unfilled = nights.length - assigned;
+    var body =
+      (unfilled > 0
+        ? '<p class="stay-alert">' + unfilled + '박이 아직 비어 있어요 · 아래에서 숙소를 골라 주세요</p>'
+        : '<p class="stay-alert ok">모든 박에 숙소가 배정됐어요</p>') +
+      '<div class="stay-quick"><label for="stayAll"><span>전 일정 같은 숙소</span>' +
+        '<select id="stayAll" data-change="stay-all"><option value="">선택 안 함</option>' + stayOptionsHtml(t, '', '', true) + '</select>' +
+      '</label></div>' +
+      stayNightRowsHtml(t, nights, segMap) +
+      '<div class="stay-cmp"><div class="sc-head"><b>후보 비교</b><span>' + lodging.length + '곳 · 박 버튼을 누르면 바로 배정</span></div>' +
+        stayCityGroups(t).map(function (g) {
+          return '<div class="sc-city"><h3>' + esc(g.city || '기타') + ' <small>' + g.items.length + '</small></h3>' +
+            '<div class="sc-grid">' + g.items.map(function (l) { return stayCardHtml(t, l, nights, segMap); }).join('') + '</div></div>';
+        }).join('') +
+      '</div>' +
+      staySegmentsHtml(t, nights);
+
+    return '<section class="panel stay-panel">' + head + summary + body + '</section>';
+  }
+
   function viewInfo(t) {
     var auto = EMERGENCY[normCountry(t.country)] || [];
     var overseas = !isKorea(t.country);
     return '' +
-      '<section class="panel"><div class="section-head"><div><h2>숙소</h2><p>체크인 시간과 주소를 한곳에</p></div>' +
-        '<button type="button" class="btn btn-soft" data-action="add-lodging">+ 숙소</button></div>' +
-        (t.info.lodging.length
-          ? '<div class="place-grid" style="margin-top:8px">' + t.info.lodging.map(function (l) {
-            return '<article class="place-card">' +
-              '<div class="place-head"><span class="type-badge">숙소</span>' +
-                '<span class="city-badge">' + esc(l.city || t.cities[0]) + '</span></div>' +
-              '<h3>' + esc(l.name) + '</h3>' +
-              (l.address ? '<p class="place-meta">' + esc(l.address) + '</p>' : '') +
-              (l.checkin || l.checkout ? '<p class="place-meta muted">체크인 ' + esc(l.checkin || '-') + ' · 체크아웃 ' + esc(l.checkout || '-') + '</p>' : '') +
-              (l.phone ? '<p class="place-meta muted">☎ ' + esc(l.phone) + '</p>' : '') +
-              '<div class="place-actions">' +
-                mapAnchor(t, { city: l.city || (t.cities[0] || ''), place: l.address || l.name, country: t.country }, '길찾기') +
-                '<button type="button" class="icon-btn" data-action="edit-lodging" data-id="' + l.id + '" aria-label="숙소 수정">' + ICONS.edit + '</button>' +
-                '<button type="button" class="icon-btn danger" data-action="del-lodging" data-id="' + l.id + '" aria-label="숙소 삭제">' + ICONS.trash + '</button>' +
-              '</div></article>';
-          }).join('') + '</div>'
-          : '<p class="hint">등록된 숙소가 없습니다.</p>') +
-      '</section>' +
+      staySectionHtml(t) +
       '<section class="panel"><div class="section-head"><div><h2>긴급 연락처</h2><p>' + esc(t.country) + ' 기준 자동 안내</p></div></div>' +
         '<div class="info-block">' +
           auto.map(function (row) {
@@ -1669,6 +2068,7 @@
     target.outbound = resolveLeg(d.legs.out, d.cities[0], defaultLegMode(country));
     target.inbound = resolveLeg(d.legs.in, '', defaultLegMode(country));
     syncTripLegs(target);
+    reconcileStay(target);
     markOnboarded();
     save();
     closeModal();
@@ -2789,17 +3189,57 @@
     stays.forEach(function (e, i) {
       if (t.info.lodging.some(function (l) { return l.name === e.name; })) { stats.skip++; return; }
       t.info.lodging.push({
-        id: uid('lg'), name: e.name, address: '', checkin: '15:00', checkout: '11:00', phone: '', city: city
+        id: uid('lg'), name: e.name, address: '', checkin: STAY_DEFAULT_IN, checkout: STAY_DEFAULT_OUT,
+        phone: '', city: city, zone: e.zone || '', memo: e.memo || '',
+        lat: e.lat || '', lon: e.lon || '', src: 'curation'
       });
       var from = i * per + 1;
       var to = i === stays.length - 1 ? nights : Math.min(nights, (i + 1) * per);
       var nightLabel = nights >= stays.length ? (stays.length === 1 ? nights + '박' : from + '~' + to + '박차')
         : '후보 ' + (i + 1);
       var line = '숙소 · ' + city + ': ' + e.name + (e.memo ? ' (' + e.memo + ')' : '') +
-        ' · ' + nightLabel + ' · 체크인 15:00 · 체크아웃 11:00';
+        ' · ' + nightLabel + ' · 체크인 ' + STAY_DEFAULT_IN + ' · 체크아웃 ' + STAY_DEFAULT_OUT;
       if (t.info.memo.indexOf(e.name) < 0) t.info.memo = (t.info.memo ? t.info.memo + '\n' : '') + line;
       stats.lodging++;
     });
+  }
+
+  /* 여행 도시의 추천 숙소(기본 큐레이션 DB)를 비교 후보로 한 번에 담기 */
+  function recommendStays() {
+    var t = activeTrip();
+    if (!t) return;
+    var added = 0, missing = [], had = 0;
+    t.cities.forEach(function (city) {
+      var base = curationFor(city);
+      var stays = list(base.list).filter(function (x) { return x.kind === 'stay' && !base.fallback; });
+      var online = CUR_ONLINE[city];
+      if (!stays.length && online && online.status === 'done') {
+        stays = list(online.items).filter(function (x) { return x.kind === 'stay'; });
+      }
+      if (!stays.length) { missing.push(city); return; }
+      stays.forEach(function (e) {
+        var dup = t.info.lodging.some(function (l) {
+          return l.name === e.name && ((l.city || '') === city || !l.city);
+        });
+        if (dup) { had++; return; }
+        t.info.lodging.push({
+          id: uid('lg'), name: e.name, address: '', checkin: STAY_DEFAULT_IN, checkout: STAY_DEFAULT_OUT,
+          phone: '', city: city, zone: e.zone || '', memo: e.memo || '',
+          lat: e.lat || '', lon: e.lon || '', src: 'curation'
+        });
+        added++;
+      });
+    });
+    if (!added) {
+      if (missing.length && !had) toast(missing.join(' · ') + ' 추천 숙소가 없어요 · 동선 추천의 🌐 실시간 검색을 먼저 하거나 숙소를 직접 추가해 주세요');
+      else toast('이미 추천 숙소가 모두 담겨 있어요');
+      return;
+    }
+    touchTrip(t);
+    save();
+    render();
+    toast('추천 숙소 ' + added + '곳을 비교 목록에 담았어요' +
+      (missing.length ? ' · ' + missing.join('·') + '은(는) 직접 추가' : ''));
   }
 
   /* ---------- schedule item modal ---------- */
@@ -2875,6 +3315,21 @@
       memo: String(v.memo || '').trim(),
       country: v.country && v.country !== '__trip__' ? v.country : ''
     });
+    /* 숙소 자동 일정을 고치면 정보 탭 숙소 계획(구간)에도 시간·날짜를 반영 */
+    if (item.autoKind && item.staySegId) {
+      var seg = list(t.info.stayPlan).filter(function (s) { return s.id === item.staySegId; })[0];
+      if (seg) {
+        if (item.autoKind === 'stay-checkin') {
+          seg.checkinDate = target.date;
+          seg.checkinTime = item.time;
+          if (seg.checkoutDate <= seg.checkinDate) seg.checkoutDate = addDaysISO(seg.checkinDate, 1);
+        } else {
+          seg.checkoutDate = target.date;
+          seg.checkoutTime = item.time;
+          if (seg.checkoutDate <= seg.checkinDate) seg.checkinDate = addDaysISO(seg.checkoutDate, -1);
+        }
+      }
+    }
     target.items.push(item);
     target.items.sort(sortByTime);
     touchTrip(t);
@@ -3136,17 +3591,19 @@
     var l = id ? t.info.lodging.filter(function (x) { return x.id === id; })[0] : null;
     recordModal({
       title: l ? '숙소 수정' : '숙소 추가',
-      subtitle: '체크인 시간과 주소를 적어 두면 현지에서 바로 찾을 수 있어요.',
+      subtitle: '체크인 시간·주소·특징을 적어 두면 비교 카드와 일정에 그대로 쓰입니다.',
       form: 'lodging',
       submitLabel: l ? '저장' : '추가',
       fields: [
         { name: 'id', type: 'hidden', value: l ? l.id : '' },
-        { name: 'name', label: '숙소 이름', type: 'text', required: true, maxlength: 60, value: l ? l.name : '', placeholder: '예: 경주 한옥스테이', span: 2 },
-        { name: 'address', label: '주소', type: 'text', optional: true, maxlength: 90, value: l ? l.address : '', placeholder: '지도 검색에 사용됩니다', span: 2 },
+        { name: 'name', label: '숙소 이름', type: 'text', required: true, maxlength: 60, value: l ? l.name : '', placeholder: '예: 라한셀렉트 경주', span: 2 },
         { name: 'city', label: '도시', type: 'datalist', options: t.cities, value: l ? l.city : (t.cities[0] || '') },
+        { name: 'zone', label: '권역', type: 'text', optional: true, maxlength: 40, value: l ? l.zone : '', placeholder: '예: 보문 · 해운대' },
+        { name: 'address', label: '주소', type: 'text', optional: true, maxlength: 90, value: l ? l.address : '', placeholder: '지도 검색에 사용됩니다', span: 2 },
         { name: 'phone', label: '전화', type: 'tel', optional: true, maxlength: 30, value: l ? l.phone : '', placeholder: '예: +81-3-0000-0000' },
-        { name: 'checkin', label: '체크인', type: 'text', optional: true, maxlength: 20, value: l ? l.checkin : '', placeholder: '15:00' },
-        { name: 'checkout', label: '체크아웃', type: 'text', optional: true, maxlength: 20, value: l ? l.checkout : '', placeholder: '11:00' }
+        { name: 'checkin', label: '기본 체크인', type: 'text', optional: true, maxlength: 5, value: l ? (l.checkin || STAY_DEFAULT_IN) : STAY_DEFAULT_IN, placeholder: '15:00' },
+        { name: 'checkout', label: '기본 체크아웃', type: 'text', optional: true, maxlength: 5, value: l ? (l.checkout || STAY_DEFAULT_OUT) : STAY_DEFAULT_OUT, placeholder: '11:00' },
+        { name: 'memo', label: '특징 · 가격대', type: 'textarea', optional: true, rows: 2, value: l ? l.memo : '', placeholder: '예: 4성 · 보문호 레이크뷰 · 1박 18만원대', span: 2 }
       ]
     });
   }
@@ -3158,18 +3615,25 @@
     var name = String(v.name || '').trim();
     if (!name) { formError(form, '숙소 이름을 입력해 주세요.'); return; }
     var l = v.id ? t.info.lodging.filter(function (x) { return x.id === v.id; })[0] : null;
-    if (!l) { l = { id: uid('lg') }; t.info.lodging.push(l); }
+    if (!l) { l = { id: uid('lg'), src: 'manual' }; t.info.lodging.push(l); }
     l.name = name;
     l.address = String(v.address || '').trim();
     l.city = String(v.city || '').trim();
+    l.zone = String(v.zone || '').trim();
     l.phone = String(v.phone || '').trim();
-    l.checkin = String(v.checkin || '').trim();
-    l.checkout = String(v.checkout || '').trim();
-    touchTrip(t);
-    save();
+    l.checkin = parseTime(v.checkin) === null ? STAY_DEFAULT_IN : String(v.checkin).trim();
+    l.checkout = parseTime(v.checkout) === null ? STAY_DEFAULT_OUT : String(v.checkout).trim();
+    l.memo = String(v.memo || '').trim();
+    if (l.lat === undefined) l.lat = '';
+    if (l.lon === undefined) l.lon = '';
+    /* 이미 잡아 둔 숙박 구간에도 이름·도시 변경을 반영 */
+    list(t.info.stayPlan).forEach(function (seg) {
+      if (seg.lodgingId !== l.id) return;
+      seg.name = l.name;
+      if (l.city) seg.city = l.city;
+    });
     closeModal();
-    render();
-    toast(v.id ? '숙소를 수정했어요' : '숙소를 추가했어요');
+    commitStay(t, v.id ? '숙소를 수정했어요' : '숙소를 추가했어요');
   }
 
   function openCheckModal(id) {
@@ -3359,6 +3823,7 @@
       settings: state.settings
     });
     state = next;
+    reconcileStayPlans();
     ui.tab = 'all';
     ui.day = 1;
     ui.allDays = false;
@@ -3554,12 +4019,22 @@
     'del-item': function (el) {
       var found = findItem(el.dataset.id);
       if (!found) return;
-      openConfirm('일정 삭제', "'" + esc(found.item.title) + "' 일정을 삭제할까요?", '삭제', function () {
-        found.day.items = found.day.items.filter(function (x) { return x.id !== found.item.id; });
-        touchTrip(found.trip);
-        save(); closeModal(); render();
-        toast('일정을 삭제했어요');
-      });
+      var isAutoStay = found.item.autoKind === 'stay-checkin' || found.item.autoKind === 'stay-checkout';
+      openConfirm('일정 삭제', "'" + esc(found.item.title) + "' 일정을 삭제할까요?" +
+        (isAutoStay ? ' 숙소 계획의 체크인·체크아웃에서만 빼 두고, 정보 탭 숙소 계획에서 언제든 다시 넣을 수 있습니다.' : ''),
+        '삭제', function () {
+          if (isAutoStay) {
+            var seg = list(found.trip.info.stayPlan).filter(function (s) { return s.id === found.item.staySegId; })[0];
+            if (seg) {
+              if (found.item.autoKind === 'stay-checkin') seg.hideCheckin = true;
+              else seg.hideCheckout = true;
+            }
+          }
+          found.day.items = found.day.items.filter(function (x) { return x.id !== found.item.id; });
+          touchTrip(found.trip);
+          save(); closeModal(); render();
+          toast(isAutoStay ? '숙소 일정을 뺐어요 · 정보 탭에서 다시 넣을 수 있어요' : '일정을 삭제했어요');
+        });
     },
     'shift-item': function (el) {
       var found = findItem(el.dataset.id);
@@ -3625,16 +4100,53 @@
 
     'add-lodging': function () { openLodgingModal(null); },
     'edit-lodging': function (el) { openLodgingModal(el.dataset.id); },
+    'stay-recommend': function () { recommendStays(); },
+    'stay-night-toggle': function (el) {
+      var t = activeTrip();
+      if (!t) return;
+      var date = el.dataset.date, lid = el.dataset.lodging;
+      var map = stayNightSegmentMap(t);
+      var cur = map[date] ? map[date].lodgingId : '';
+      var next = cur === lid ? '' : lid;
+      if (!assignStayNight(t, date, next)) return;
+      var day = stayDayByDate(t, date);
+      var lod = lodgingById(t, lid);
+      commitStay(t, next
+        ? 'DAY ' + (day ? day.n : '') + ' 밤 · ' + (lod ? lod.name : '숙소') + ' 배정'
+        : 'DAY ' + (day ? day.n : '') + ' 밤 배정을 해제했어요');
+    },
+    'stay-seg-del': function (el) {
+      var t = activeTrip();
+      if (!t) return;
+      var seg = list(t.info.stayPlan).filter(function (x) { return x.id === el.dataset.seg; })[0];
+      if (!seg) return;
+      openConfirm('숙소 구간 해제', "'" + esc(seg.name) + "' 구간의 체크인·체크아웃 일정을 뺄까요? 숙소 후보는 그대로 남습니다.",
+        '해제', function () {
+          clearStaySegment(t, seg);
+          commitStay(t, '숙소 구간을 해제했어요');
+        });
+    },
+    'stay-unhide': function (el) {
+      var t = activeTrip();
+      if (!t) return;
+      var seg = list(t.info.stayPlan).filter(function (x) { return x.id === el.dataset.seg; })[0];
+      if (!seg) return;
+      if (el.dataset.kind === 'checkin') seg.hideCheckin = false;
+      else seg.hideCheckout = false;
+      commitStay(t, (el.dataset.kind === 'checkin' ? '체크인' : '체크아웃') + ' 일정을 다시 넣었어요');
+    },
     'del-lodging': function (el) {
       var t = activeTrip();
       var l = t && t.info.lodging.filter(function (x) { return x.id === el.dataset.id; })[0];
       if (!l) return;
-      openConfirm('숙소 삭제', "'" + esc(l.name) + "' 숙소를 삭제할까요?", '삭제', function () {
-        t.info.lodging = t.info.lodging.filter(function (x) { return x.id !== l.id; });
-        touchTrip(t);
-        save(); closeModal(); render();
-        toast('숙소를 삭제했어요');
-      });
+      var used = list(t.info.stayPlan).filter(function (s) { return s.lodgingId === l.id; }).length;
+      openConfirm('숙소 삭제', "'" + esc(l.name) + "' 숙소를 삭제할까요?" +
+        (used ? ' 이 숙소로 잡은 ' + used + '개 구간과 체크인·체크아웃 일정도 함께 빠집니다.' : ''),
+        '삭제', function () {
+          t.info.lodging = t.info.lodging.filter(function (x) { return x.id !== l.id; });
+          t.info.stayPlan = list(t.info.stayPlan).filter(function (s) { return s.lodgingId !== l.id; });
+          commitStay(t, '숙소를 삭제했어요');
+        });
     },
 
     'edit-check': function (el) { openCheckModal(el.dataset.id); },
@@ -3704,6 +4216,49 @@
       var row = el.closest('.check-item');
       if (row) row.classList.toggle('done', c.done);
       refreshCheckStats(t);
+      return;
+    }
+
+    if (el.matches('[data-change="stay-night"]')) {
+      var st = activeTrip();
+      if (!st) return;
+      if (!assignStayNight(st, el.dataset.date, el.value)) return;
+      commitStay(st, el.value ? '숙소 배정을 저장했어요' : '숙소 배정을 해제했어요');
+      return;
+    }
+
+    if (el.matches('[data-change="stay-all"]')) {
+      var sa = activeTrip();
+      if (!sa) return;
+      assignAllStayNights(sa, el.value);
+      commitStay(sa, el.value ? '전 일정 숙소를 같게 맞췄어요' : '숙소 배정을 모두 해제했어요');
+      return;
+    }
+
+    if (el.matches('[data-change="stay-seg-time"]')) {
+      var stt = activeTrip();
+      if (!stt) return;
+      var segT = list(stt.info.stayPlan).filter(function (x) { return x.id === el.dataset.seg; })[0];
+      if (!segT) return;
+      var tv = String(el.value || '').trim();
+      if (parseTime(tv) === null) { toast('시간을 다시 골라 주세요'); render(); return; }
+      if (el.dataset.kind === 'checkin') segT.checkinTime = tv;
+      else segT.checkoutTime = tv;
+      commitStay(stt, (el.dataset.kind === 'checkin' ? '체크인 ' : '체크아웃 ') + tv + ' 반영');
+      return;
+    }
+
+    if (el.matches('[data-change="stay-seg-date"]')) {
+      var sdt = activeTrip();
+      if (!sdt) return;
+      var segD = list(sdt.info.stayPlan).filter(function (x) { return x.id === el.dataset.seg; })[0];
+      if (!segD) return;
+      if (!setStaySegmentDate(sdt, segD, el.dataset.kind, el.value)) {
+        toast('체크아웃은 체크인 다음 날 이후로 정해 주세요');
+        render();
+        return;
+      }
+      commitStay(sdt, (el.dataset.kind === 'checkin' ? '체크인' : '체크아웃') + ' 날짜를 옮겼어요');
       return;
     }
 
@@ -3884,6 +4439,8 @@
     if (!state.trips.length) {
       /* keep empty; user can create or re-add samples */
     }
+    reconcileStayPlans();
+    save();
     updateNet();
     window.addEventListener('online', updateNet);
     window.addEventListener('offline', updateNet);
