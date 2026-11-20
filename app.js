@@ -11,6 +11,8 @@
   /* ---------- constants ---------- */
   var STORE_KEY = 'mtp.state.v1';
   var ONBOARD_KEY = 'mtp.onboarded.v1';
+  /* 여행 플래너 전용 구글 시트(Apps Script) 웹앱 — 기본 연동 주소 */
+  var DEFAULT_SHEET_URL = 'https://script.google.com/macros/s/AKfycbwhfR7Pw8_NMz2pWmebFUd1-r26kLfv5lvzSds6F0MO0R4gtVzL-4KRfv7D5LfUZiHDNg/exec';
 
   var SVG_HEAD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">';
   var ICONS = {
@@ -361,7 +363,7 @@
       version: 1,
       activeId: null,
       updatedAt: nowISO(),
-      settings: { sheetUrl: '', autoSync: false, lastSyncAt: '' },
+      settings: { sheetUrl: DEFAULT_SHEET_URL, autoSync: false, lastSyncAt: '' },
       trips: []
     };
   }
@@ -588,6 +590,13 @@
     var st = (raw && typeof raw === 'object') ? raw : {};
     var out = freshState();
     out.settings = Object.assign({}, out.settings, st.settings || {});
+    /* 기존 기기의 localStorage에 빈 문자열로 저장된 경우 기본 연동 주소로 자동 보정
+       (사용자가 직접 다른 URL을 입력해 저장한 경우에는 그 값을 그대로 존중) */
+    if (!out.settings.sheetUrl || !String(out.settings.sheetUrl).trim()) {
+      out.settings.sheetUrl = DEFAULT_SHEET_URL;
+    } else {
+      out.settings.sheetUrl = String(out.settings.sheetUrl).trim();
+    }
     out.trips = list(st.trips).map(normalizeTrip).filter(Boolean);
     out.activeId = (st.activeId && out.trips.some(function (t) { return t.id === st.activeId; }))
       ? st.activeId
