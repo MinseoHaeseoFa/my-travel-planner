@@ -41,7 +41,7 @@
   ];
 
   var CATS = {
-    '핵심': { cls: 'c-core', emoji: '📍', color: '#C8562F' },
+    '즐길거리': { cls: 'c-core', emoji: '📍', color: '#C8562F' },
     '이동': { cls: 'c-move', emoji: '🚇', color: '#2A5FA8' },
     '식사': { cls: 'c-meal', emoji: '🍽', color: '#B87A16' },
     '카페': { cls: 'c-cafe', emoji: '☕', color: '#8A5A3B' },
@@ -373,11 +373,13 @@
     var time = String(raw.time || '09:00');
     if (parseTime(time) === null) time = '09:00';
     var leg = (raw.leg === 'outbound' || raw.leg === 'inbound' || raw.leg === 'segment') ? raw.leg : '';
+    /* 구버전 데이터(localStorage·시트·JSON 백업)의 '핵심' 카테고리를 '즐길거리'로 자동 변환 */
+    var rawCat = raw.category === '핵심' ? '즐길거리' : raw.category;
     return {
       id: raw.id || uid('it'),
       time: time,
       title: String(raw.title || '일정'),
-      category: CATS[raw.category] ? raw.category : '핵심',
+      category: CATS[rawCat] ? rawCat : '즐길거리',
       city: String(raw.city || ''),
       place: String(raw.place || ''),
       memo: String(raw.memo || ''),
@@ -687,22 +689,22 @@
     g.days = [
       { n: 1, date: gStart, city: '경주', items: [
         mkItem('08:30', '서울역 → 신경주 KTX', '이동', '신경주역', '약 2시간 10분 · 좌석 미지정'),
-        mkItem('11:00', '불국사', '핵심', '불국사', '관람 1시간 30분 · 편한 신발'),
+        mkItem('11:00', '불국사', '즐길거리', '불국사', '관람 1시간 30분 · 편한 신발'),
         mkItem('13:00', '남산 아래 한정식', '식사', '경주 남산', '예약 권장'),
-        mkItem('15:00', '첨성대 · 동궁과 월지', '핵심', '동궁과 월지', '야간 개장 시간 확인'),
+        mkItem('15:00', '첨성대 · 동궁과 월지', '즐길거리', '동궁과 월지', '야간 개장 시간 확인'),
         mkItem('18:30', '황리단길 한옥 카페', '카페', '황리단길', '주차 어려움 · 도보 이동'),
-        mkItem('20:00', '한옥스테이 체크인', '핵심', '경주 한옥스테이', '조용한 골목 안쪽')
+        mkItem('20:00', '한옥스테이 체크인', '즐길거리', '경주 한옥스테이', '조용한 골목 안쪽')
       ] },
       { n: 2, date: addDaysISO(gStart, 1), city: '부산', items: [
         mkItem('09:30', '경주 → 부산 시외버스', '이동', '부산시외버스터미널', '약 1시간'),
-        mkItem('11:30', '감천문화마을', '핵심', '감천문화마을', '오르막길 · 사진 명소'),
+        mkItem('11:30', '감천문화마을', '즐길거리', '감천문화마을', '오르막길 · 사진 명소'),
         mkItem('13:00', '서면 돼지국밥', '식사', '부산 서면', '점심 시간대 붐빔'),
         mkItem('15:30', '흰여울문화마을', '체험', '흰여울문화마을', '해안 산책로'),
-        mkItem('18:30', '광안리 해변 산책', '핵심', '광안리해수욕장'),
+        mkItem('18:30', '광안리 해변 산책', '즐길거리', '광안리해수욕장'),
         mkItem('20:00', '광안대교 야경 카페', '카페', '광안리', '야경 명소')
       ] },
       { n: 3, date: addDaysISO(gStart, 2), city: '부산', items: [
-        mkItem('09:30', '해운대 해수욕장', '핵심', '해운대해수욕장'),
+        mkItem('09:30', '해운대 해수욕장', '즐길거리', '해운대해수욕장'),
         mkItem('11:00', '블루라인파크 해변열차', '체험', '블루라인파크 미포정거장', '예약 시간 30분 전 도착'),
         mkItem('13:00', '해운대 밀면', '식사', '해운대'),
         mkItem('15:00', '부산역 → 서울역 KTX', '이동', '부산역', '약 2시간 40분')
@@ -747,26 +749,26 @@
       { n: 1, date: tStart, city: '도쿄', items: [
         mkItem('10:30', '인천 → 나리타', '이동', '나리타국제공항', '샘플 항공편 · 약 2시간 20분'),
         mkItem('14:00', '스카이라이너 → 우에노', '이동', '게이세이우에노역', '약 45분'),
-        mkItem('15:30', '호텔 체크인', '핵심', '도쿄 우에노 호텔'),
-        mkItem('18:30', '시부야 스크램블 교차로', '핵심', '시부야 스크램블 교차로'),
+        mkItem('15:30', '호텔 체크인', '즐길거리', '도쿄 우에노 호텔'),
+        mkItem('18:30', '시부야 스크램블 교차로', '즐길거리', '시부야 스크램블 교차로'),
         mkItem('20:00', '시부야 이자카야 저녁', '식사', '시부야')
       ] },
       { n: 2, date: addDaysISO(tStart, 1), city: '도쿄', items: [
         mkItem('08:30', '쓰키지 장외시장 아침', '식사', '쓰키지 장외시장', '오전 일찍 붐빕니다'),
-        mkItem('11:00', '센소지 · 아사쿠사', '핵심', '센소지'),
+        mkItem('11:00', '센소지 · 아사쿠사', '즐길거리', '센소지'),
         mkItem('14:00', '아사쿠사 카페', '카페', '아사쿠사', '디저트 맛집 골목'),
         mkItem('16:00', '아키하바라', '체험', '아키하바라'),
-        mkItem('19:00', '도쿄타워 전망', '핵심', '도쿄타워', '전망대 사전 예약 가능')
+        mkItem('19:00', '도쿄타워 전망', '즐길거리', '도쿄타워', '전망대 사전 예약 가능')
       ] },
       { n: 3, date: addDaysISO(tStart, 2), city: '교토', items: [
         mkItem('08:00', '신칸센 도쿄 → 교토', '이동', '도쿄역', '노조미 약 2시간 15분'),
-        mkItem('11:00', '기요미즈데라', '핵심', '기요미즈데라', '이쓰쓰지역 하차 · 오르막'),
+        mkItem('11:00', '기요미즈데라', '즐길거리', '기요미즈데라', '이쓰쓰지역 하차 · 오르막'),
         mkItem('13:00', '니시키시장 점심', '식사', '니시키시장'),
-        mkItem('15:30', '후시미 이나리 다이샤', '핵심', '후시미 이나리 다이샤', '토리이 터널 · 저녁 무렵 한산'),
+        mkItem('15:30', '후시미 이나리 다이샤', '즐길거리', '후시미 이나리 다이샤', '토리이 터널 · 저녁 무렵 한산'),
         mkItem('19:00', '폰토초 저녁', '식사', '폰토초')
       ] },
       { n: 4, date: addDaysISO(tStart, 3), city: '교토', items: [
-        mkItem('09:00', '아라시야마 대나무숲', '핵심', '아라시야마 대나무숲', '이른 시간이 한적'),
+        mkItem('09:00', '아라시야마 대나무숲', '즐길거리', '아라시야마 대나무숲', '이른 시간이 한적'),
         mkItem('11:00', '도게츠교 카페', '카페', '도게츠교'),
         mkItem('13:00', '간사이공항으로 이동', '이동', '간사이국제공항', '하루카 약 1시간 20분'),
         mkItem('16:30', '간사이 → 인천', '이동', '간사이국제공항', '샘플 항공편')
@@ -1334,7 +1336,7 @@
   }
 
   function itemCard(t, d, it) {
-    var cat = CATS[it.category] || CATS['핵심'];
+    var cat = CATS[it.category] || CATS['즐길거리'];
     var ctx = itemMapContext(t, d, it);
     var noMap = it.src === 'skeleton';
     if (it.from && it.to) return moveCard(t, d, it);
@@ -3136,7 +3138,7 @@
   }
 
   function pushCurationItem(t, d, e, startMin, city, country) {
-    var category = e.kind === 'meal' ? '식사' : e.kind === 'cafe' ? '카페' : (e.kind === 'exp' ? '체험' : '핵심');
+    var category = e.kind === 'meal' ? '식사' : e.kind === 'cafe' ? '카페' : (e.kind === 'exp' ? '체험' : '즐길거리');
     var memo = '[' + (e.zone || '중심') + '] ' + (e.memo || '') + ' · 예상 ' + e.dur + '분';
     d.items.push({
       id: uid('it'),
@@ -3283,7 +3285,7 @@
         { name: 'day', label: 'DAY', type: 'select', options: dayOptions, value: String(dayN) },
         { name: 'time', label: '시간', type: 'time', value: item ? item.time : '09:00' },
         { name: 'title', label: '일정 이름', type: 'text', value: item ? item.title : '', placeholder: '예: 불국사 관람', required: true, maxlength: 60, span: 2 },
-        { name: 'category', label: '카테고리', type: 'select', options: Object.keys(CATS), value: item ? item.category : '핵심' },
+        { name: 'category', label: '카테고리', type: 'select', options: Object.keys(CATS), value: item ? item.category : '즐길거리' },
         { name: 'city', label: '도시', type: 'datalist', options: t.cities, value: item ? item.city : '', placeholder: '비우면 그날 도시 · 예: 오사카' },
         { name: 'place', label: '장소명', type: 'text', optional: true, value: item ? item.place : '', placeholder: '지도 검색에 사용됩니다', span: 2 },
         { name: 'memo', label: '메모', type: 'textarea', optional: true, rows: 2, value: item ? item.memo : '', placeholder: '예약 시간, 준비물, 주의사항', span: 2 },
@@ -3318,7 +3320,7 @@
     item = Object.assign(item || { id: uid('it') }, {
       time: v.time || '09:00',
       title: title,
-      category: CATS[v.category] ? v.category : '핵심',
+      category: CATS[v.category] ? v.category : '즐길거리',
       city: String(v.city || '').trim(),
       place: String(v.place || '').trim(),
       memo: String(v.memo || '').trim(),
