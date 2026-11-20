@@ -1082,7 +1082,8 @@ details.gs-details summary {
    ========================================================================== */
 @media (max-width: 459px) {
   .brand { flex: 1 1 auto; }
-  .brand-text p { display: none; }
+  /* 부제도 모바일에서 그대로 노출 — 살짝 줄여 헤더 한 줄 안에 들어오게 */
+  .brand-text p { font-size: 10.5px; letter-spacing: -.005em; }
   .hub-home { height: 36px; padding: 0 10px; font-size: 11.5px; margin-left: auto; }
 }
 
