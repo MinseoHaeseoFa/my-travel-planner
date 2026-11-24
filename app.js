@@ -4574,7 +4574,11 @@
     var p = st.points.filter(function (x) { return x.n === Number(n); })[0];
     if (!p || !p.ok || !p.marker) return;
     st.map.flyTo([p.lat, p.lon], Math.max(st.map.getZoom(), 14), { duration: .45 });
-    p.marker.openPopup();
+    /* flyTo 애니메이션이 끝난 뒤 팝업을 열어야 autoPan이 최종 위치 기준으로 동작합니다 */
+    setTimeout(function () {
+      if (routeState !== st || !p.marker) return;
+      p.marker.openPopup();
+    }, 520);
     routeMarkRow(p.n);
     var row = document.querySelector('#routeList .route-row[data-n="' + p.n + '"]');
     if (row && row.scrollIntoView) { try { row.scrollIntoView({ block: 'nearest' }); } catch (e) { } }
