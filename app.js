@@ -464,6 +464,7 @@
       category: CATS[rawCat] ? rawCat : '즐길거리',
       city: String(raw.city || ''),
       place: String(raw.place || ''),
+      address: String(raw.address || ''),
       memo: String(raw.memo || ''),
       country: String(raw.country || ''),
       from: String(raw.from || ''),
@@ -753,7 +754,7 @@
 
   /* ---------- sample trips ---------- */
   function mkItem(time, title, category, place, memo) {
-    return { id: uid('it'), time: time, title: title, category: category, place: place || '', memo: memo || '', city: '', country: '' };
+    return { id: uid('it'), time: time, title: title, category: category, place: place || '', address: '', memo: memo || '', city: '', country: '' };
   }
 
   function buildSamples() {
@@ -928,7 +929,8 @@
     return {
       country: item.country || (t && t.country) || '',
       city: item.city || (same ? ((day && day.city) || '') : ''),
-      place: item.place || item.title || ''
+      place: item.place || item.title || '',
+      address: item.address || ''
     };
   }
   function mapInfo(t, o) {
@@ -937,7 +939,11 @@
     var sameCountry = !o.country || normCountry(o.country) === normCountry((t && t.country) || '');
     var city = o.city || (sameCountry ? ((t && t.cities && t.cities[0]) || '') : '');
     var place = o.place || '';
-    var q = [city, place].filter(Boolean).join(' ');
+    var address = String(o.address || '').trim();
+    /* 주소가 있으면 주소(+도시·국가 문맥)를 우선 검색하고, 없으면 기존 도시+장소명 */
+    var q = address
+      ? routeQueryWith(address, { city: city, country: country })
+      : [city, place].filter(Boolean).join(' ');
     var korea = isKorea(country);
     return {
       korea: korea,
@@ -1438,10 +1444,11 @@
         '</div>' +
         '<h3>' + esc(it.title) + '</h3>' +
         ((it.place && !noMap) ? placeLink(t, ctx) : '') +
+        (it.address ? '<p class="tl-addr">' + esc(it.address) + '</p>' : '') +
         (it.memo ? '<p class="memo">' + esc(it.memo) + '</p>' : '') +
         '<div class="tl-links">' +
           (noMap ? '<span class="city-badge">추천 DB에 없는 도시 · 장소명을 직접 입력하세요</span>' : mapAnchor(t, ctx, '길찾기')) +
-          (it.country ? '<span class="city-badge">' + esc(it.country) + ' 기준</span>' : '') +
+          (it.country ? '<span class="city-badge map-note">' + esc(it.country) + ' 기준</span>' : '') +
         '</div>' +
       '</div></article>';
   }
@@ -3372,6 +3379,7 @@
         { name: 'category', label: '카테고리', type: 'select', options: Object.keys(CATS), value: item ? item.category : '즐길거리' },
         { name: 'city', label: '도시', type: 'datalist', options: t.cities, value: item ? item.city : '', placeholder: '비우면 그날 도시 · 예: 오사카' },
         { name: 'place', label: '장소명', type: 'text', optional: true, value: item ? item.place : '', placeholder: '지도 검색에 사용됩니다', span: 2 },
+        { name: 'address', label: '주소', type: 'text', optional: true, value: item ? item.address : '', placeholder: '도로명·지번 주소 (입력 시 동선 지도·길찾기 정확도 향상)', span: 2 },
         { name: 'memo', label: '메모', type: 'textarea', optional: true, rows: 2, value: item ? item.memo : '', placeholder: '예약 시간, 준비물, 주의사항', span: 2 },
         { name: 'country', label: '지도 국가', type: 'select', optional: true,
           options: [{ value: '__trip__', label: '여행 국가 따르기 (' + t.country + ')' }].concat(COUNTRIES.filter(function (c) { return c !== '기타'; })),
@@ -3392,24 +3400,30 @@
     if (!target) { formError(form, 'DAY를 선택해 주세요.'); return; }
 
     var item = null;
+    var oldDay = null;
     if (v.id) {
       for (var i = 0; i < t.days.length; i++) {
         var arr = t.days[i].items;
         for (var k = 0; k < arr.length; k++) {
-          if (arr[k].id === v.id) { item = arr.splice(k, 1)[0]; break; }
+          if (arr[k].id === v.id) { item = arr.splice(k, 1)[0]; oldDay = t.days[i]; break; }
         }
         if (item) break;
       }
     }
+    /* 주소·장소명이 바뀌면 이전 검색어의 좌표 캐시를 지워 새 기준으로 다시 조회되게 합니다 */
+    var oldQueries = item ? routeQueriesFor(t, oldDay, item) : [];
     item = Object.assign(item || { id: uid('it') }, {
       time: v.time || '09:00',
       title: title,
       category: CATS[v.category] ? v.category : '즐길거리',
       city: String(v.city || '').trim(),
       place: String(v.place || '').trim(),
+      address: String(v.address || '').trim(),
       memo: String(v.memo || '').trim(),
       country: v.country && v.country !== '__trip__' ? v.country : ''
     });
+    var newQueries = routeQueriesFor(t, target, item);
+    oldQueries.forEach(function (q) { if (newQueries.indexOf(q) < 0) routeForgetGeo(q); });
     /* 숙소 자동 일정을 고치면 정보 탭 숙소 계획(구간)에도 시간·날짜를 반영 */
     if (item.autoKind && item.staySegId) {
       var seg = list(t.info.stayPlan).filter(function (s) { return s.id === item.staySegId; })[0];
@@ -4121,16 +4135,39 @@
     return String(it.place || it.title || '').trim();
   }
 
-  function routeQueryFor(t, day, it) {
-    var name = routeItemName(it);
-    if (!name) return '';
-    var city = String(it.city || (day && day.city) || '').trim();
-    var country = String(it.country || t.country || '').trim();
-    var parts = [name];
-    var low = name.toLowerCase();
-    if (city && low.indexOf(city.toLowerCase()) < 0) parts.push(city);
-    if (country && parts.join(' ').toLowerCase().indexOf(country.toLowerCase()) < 0) parts.push(country);
+  /* 검색어에 도시·국가 문맥을 붙입니다 (이미 들어 있으면 중복하지 않음) */
+  function routeQueryWith(value, ctx) {
+    var base = String(value || '').trim();
+    if (!base) return '';
+    var city = String((ctx && ctx.city) || '').trim();
+    var country = String((ctx && ctx.country) || '').trim();
+    var parts = [base];
+    var joined = base.toLowerCase();
+    if (city && joined.indexOf(city.toLowerCase()) < 0) { parts.push(city); joined = parts.join(' ').toLowerCase(); }
+    if (country && joined.indexOf(country.toLowerCase()) < 0) parts.push(country);
     return parts.join(', ');
+  }
+
+  /* 좌표 조회 후보 — 주소가 있으면 주소(+도시·국가)를 최우선, 실패 시 장소명(+도시·국가)으로 폴백 */
+  function routeQueriesFor(t, day, it) {
+    var ctx = {
+      city: String(it.city || (day && day.city) || '').trim(),
+      country: String(it.country || (t && t.country) || '').trim()
+    };
+    var out = [];
+    var address = String(it.address || '').trim();
+    if (address) out.push(routeQueryWith(address, ctx));
+    var name = routeItemName(it);
+    if (name) out.push(routeQueryWith(name, ctx));
+    return out.filter(function (q, i) { return q && out.indexOf(q) === i; });
+  }
+
+  /* 주소·장소명을 고치면 이전 검색어의 캐시를 지워 즉시 새 기준으로 다시 조회합니다 */
+  function routeForgetGeo(q) {
+    var key = String(q || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!key || !Object.prototype.hasOwnProperty.call(routeGeoCache, key)) return;
+    delete routeGeoCache[key];
+    routeWriteGeoCache();
   }
 
   function routePointCoord(t, p) {
@@ -4138,10 +4175,18 @@
     if (p.item.lat !== '' && p.item.lon !== '' && isFinite(lat) && isFinite(lon) && !(lat === 0 && lon === 0)) {
       return Promise.resolve({ lat: lat, lon: lon, label: '일정에 저장된 좌표' });
     }
-    /* 도시·국가 문맥을 붙여 한 번만 조회합니다. 장소명만으로 다시 찾는 방식은
-       같은 이름의 다른 장소(예: 다른 지역의 '남산')를 엉뚱한 좌표로 찍을 수 있어
-       쓰지 않고, 못 찾은 항목은 '위치 미확인'으로 정직하게 남깁니다. */
-    return routeGeocode(routeQueryFor(t, p.day, p.item));
+    /* 주소가 있으면 주소(+도시·국가) → 실패 시 장소명(+도시·국가) 순으로 조회합니다.
+       장소명만으로 다시 찾는 방식은 같은 이름의 다른 장소(예: 다른 지역의 '남산')를
+       엉뚱한 좌표로 찍을 수 있어 도시·국가 문맥을 항상 붙이고,
+       못 찾은 항목은 '위치 미확인'으로 정직하게 남깁니다. */
+    var queries = routeQueriesFor(t, p.day, p.item);
+    var qi = 0;
+    function next() {
+      if (qi >= queries.length) return Promise.resolve(null);
+      var q = queries[qi++];
+      return routeGeocode(q).then(function (hit) { return hit || next(); });
+    }
+    return next();
   }
 
   /* ---------- 범위(전체 / DAY n) 수집 ---------- */
@@ -4286,7 +4331,8 @@
     var m = mapInfo(t, {
       country: p.item.country || t.country,
       city: p.item.city || p.day.city,
-      place: p.name
+      place: p.name,
+      address: p.item.address || ''
     });
     var meta;
     if (p.km !== null && p.km !== undefined) {
@@ -4300,6 +4346,7 @@
         '<div class="rp-when"><b>' + esc(p.item.time) + '</b><small>DAY ' + p.day.n + (p.day.city ? ' · ' + esc(p.day.city) : '') + '</small></div>' +
       '</div>' +
       '<h4>' + esc(p.name) + '</h4>' +
+      (p.item.address ? '<p class="rp-addr">' + esc(p.item.address) + '</p>' : '') +
       ((p.item.from && p.item.to) ? '<span class="rp-tag">이동 · 도착지</span>' : '') +
       (p.item.memo ? '<p class="rp-memo">' + esc(p.item.memo) + '</p>' : '') +
       meta +
@@ -4438,7 +4485,7 @@
     if (!st.missing.length) { box.hidden = true; box.innerHTML = ''; return; }
     box.hidden = false;
     box.innerHTML = '<strong>📍 위치 미확인 ' + st.missing.length + '곳</strong>' +
-      '<p>지도 좌표를 찾지 못한 일정입니다. 일정에서 장소명을 시·구까지 구체적으로 입력하면 다음에 표시됩니다.</p>' +
+      '<p>지도 좌표를 찾지 못한 일정입니다. 일정에 주소를 넣거나 장소명을 시·구까지 구체적으로 입력하면 다음에 표시됩니다.</p>' +
       '<ul>' + st.missing.map(function (p) {
         return '<li><b>' + (st.scope === 'all' ? 'DAY ' + p.day.n + ' · ' : '') + esc(p.item.time) + '</b> ' + esc(p.name) + '</li>';
       }).join('') + '</ul>';
