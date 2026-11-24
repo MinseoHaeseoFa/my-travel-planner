@@ -940,10 +940,8 @@
     var city = o.city || (sameCountry ? ((t && t.cities && t.cities[0]) || '') : '');
     var place = o.place || '';
     var address = String(o.address || '').trim();
-    /* 주소가 있으면 주소(+도시·국가 문맥)를 우선 검색하고, 없으면 기존 도시+장소명 */
-    var q = address
-      ? routeQueryWith(address, { city: city, country: country })
-      : [city, place].filter(Boolean).join(' ');
+    /* 주소가 있으면 주소를 그대로 검색어로 씁니다 (지도 서비스가 주소를 가장 잘 알아듣습니다) */
+    var q = address || [city, place].filter(Boolean).join(' ');
     var korea = isKorea(country);
     return {
       korea: korea,
@@ -4148,7 +4146,8 @@
     return parts.join(', ');
   }
 
-  /* 좌표 조회 후보 — 주소가 있으면 주소(+도시·국가)를 최우선, 실패 시 장소명(+도시·국가)으로 폴백 */
+  /* 좌표 조회 후보 — 주소가 있으면 주소를 최우선, 실패 시 '국가 + 주소' → 장소명(+도시·국가)으로 폴백
+     (Nominatim은 한글 도로명 주소 뒤에 ', 국가'를 붙이면 못 찾고, 앞에 붙이면 찾습니다) */
   function routeQueriesFor(t, day, it) {
     var ctx = {
       city: String(it.city || (day && day.city) || '').trim(),
@@ -4156,7 +4155,12 @@
     };
     var out = [];
     var address = String(it.address || '').trim();
-    if (address) out.push(routeQueryWith(address, ctx));
+    if (address) {
+      out.push(address);
+      if (ctx.country && address.toLowerCase().indexOf(ctx.country.toLowerCase()) < 0) {
+        out.push(ctx.country + ' ' + address);
+      }
+    }
     var name = routeItemName(it);
     if (name) out.push(routeQueryWith(name, ctx));
     return out.filter(function (q, i) { return q && out.indexOf(q) === i; });
