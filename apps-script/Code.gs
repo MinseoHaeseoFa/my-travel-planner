@@ -1,13 +1,22 @@
 /**
- * my-travel-planner · Google Sheets SSOT sync (Google Apps Script)
+ * my-travel-planner · Google Sheets SSOT sync (Google Apps Script · v4 주인장 PIN 잠금)
  *
  *  1) 새 스프레드시트 > 확장 프로그램 > Apps Script 에 이 코드를 붙여넣습니다.
- *  2) 배포 > 새 배포 > 웹 앱 / 실행 계정: 나 / 액세스: 모든 사용자 로 배포합니다.
- *  3) 나온 웹 앱 URL을 여행 플래너의 [동기화 / 백업]에 붙여넣습니다.
+ *  2) 아래 OWNER_PIN 한 줄을 원하는 숫자로 바꿉니다. (예: const OWNER_PIN = "1024";)
+ *  3) 배포 > 새 배포(또는 배포 관리 > 수정 > 새 버전) / 실행 계정: 나 / 액세스: 모든 사용자 로 배포합니다.
+ *  4) 나온 웹 앱 URL을 여행 플래너의 [동기화 / 백업]에 붙여넣습니다.
  *
+ *  - 🔒 저장(doPost)은 주인장 PIN을 통과해야만 됩니다. 불러오기(doGet)는 지금처럼 누구나 가능합니다.
  *  - 저장할 때마다 Trips 시트를 비우고 현재 여행 전체로 다시 씁니다(SSOT 초기화 후 교체).
  *  - 티켓 사진처럼 긴 데이터는 45,000자 단위로 나눠 여러 셀에 저장합니다.
  */
+
+// ==========================================
+// 🔒 주인장 PIN — 이 한 줄만 바꾸세요 (예: "1024")
+// ==========================================
+var OWNER_PIN = "여기에_원하는_PIN_입력";
+var OWNER_PIN_PLACEHOLDER_MARK = '여기에_원하는_PIN_입력';
+
 var SHEET_NAME = 'Trips';
 var CHUNK = 45000;
 
@@ -19,15 +28,85 @@ function doGet(e) {
 }
 
 function doPost(e) {
+  var raw = (e && e.postData && e.postData.contents) || '';
   var body = {};
-  try {
-    body = JSON.parse((e && e.postData && e.postData.contents) || '{}');
-  } catch (err) {
-    return out_({ ok: false, error: 'invalid json' });
+  var parsed = false;
+  if (raw) {
+    try {
+      body = JSON.parse(raw) || {};
+      parsed = (typeof body === 'object');
+    } catch (err) {
+      body = {};
+      parsed = false;   // form-urlencoded 본문은 e.parameter 로 읽습니다
+    }
   }
+
+  // 🔒 1) 주인장 PIN 검증 — 통과하지 못하면 아무것도 쓰지 않습니다.
+  var auth = checkOwnerPin_(extractPin_(e, body));
+  if (!auth.ok) return out_(auth.response);
+
+  if (!parsed) return out_({ ok: false, error: 'invalid json' });
+
   if (body.action === 'save') return out_(saveAll_(body.state || {}));
   if (body.action === 'ping') return out_({ ok: true, action: 'ping', time: new Date().toISOString() });
   return out_({ ok: false, error: 'unknown action' });
+}
+
+// ==========================================
+// 🔒 주인장 PIN 검증 (v4)
+//   · JSON 본문(text/plain)과 form-urlencoded(e.parameter) 모두에서 pin을 읽습니다.
+//   · body.pin / body.state.pin / e.parameter.pin 어느 쪽이든 인식합니다.
+// ==========================================
+function extractPin_(e, body) {
+  var candidates = [];
+  if (e && e.parameter && e.parameter.pin !== undefined) candidates.push(e.parameter.pin);
+  if (body && body.pin !== undefined) candidates.push(body.pin);
+  if (body && body.state && body.state.pin !== undefined) candidates.push(body.state.pin);
+  if (body && body.data && typeof body.data === 'object' && body.data.pin !== undefined) candidates.push(body.data.pin);
+  for (var i = 0; i < candidates.length; i++) {
+    var v = candidates[i];
+    if (v !== undefined && v !== null && String(v) !== '') return String(v).trim();
+  }
+  return '';
+}
+
+function isOwnerPinConfigured_() {
+  var p = String(OWNER_PIN || '').trim();
+  if (!p) return false;
+  if (p === OWNER_PIN_PLACEHOLDER_MARK) return false;
+  if (p.indexOf('여기에') > -1) return false;
+  return true;
+}
+
+function checkOwnerPin_(pin) {
+  if (!isOwnerPinConfigured_()) {
+    return {
+      ok: false,
+      response: {
+        ok: false, status: 'error', code: 'PIN_NOT_CONFIGURED', error: 'PIN_NOT_CONFIGURED',
+        message: '서버의 OWNER_PIN이 아직 설정되지 않았습니다. Apps Script 맨 위의 OWNER_PIN 값을 바꾼 뒤 [배포 > 새 버전]으로 올려 주세요.'
+      }
+    };
+  }
+  if (!pin) {
+    return {
+      ok: false,
+      response: {
+        ok: false, status: 'error', code: 'UNAUTHORIZED', error: 'UNAUTHORIZED',
+        message: '주인장 PIN이 필요합니다.'
+      }
+    };
+  }
+  if (String(pin).trim() !== String(OWNER_PIN).trim()) {
+    return {
+      ok: false,
+      response: {
+        ok: false, status: 'error', code: 'UNAUTHORIZED', error: 'UNAUTHORIZED',
+        message: '주인장 PIN이 일치하지 않습니다.'
+      }
+    };
+  }
+  return { ok: true };
 }
 
 function sheet_() {
