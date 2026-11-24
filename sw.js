@@ -2,8 +2,9 @@
    - 앱 셸을 캐시해 비행기 모드에서도 실행
    - 같은 출처 GET은 네트워크 우선, 실패하면 캐시로 응답
    - 구글 시트(Apps Script) 요청은 캐시하지 않고 그대로 통과
+   - Leaflet CDN·OSM 타일(다른 출처)은 그대로 네트워크로 통과 (동선 보기 지도)
 */
-const CACHE = 'mtp-shell-v11-20261124a';
+const CACHE = 'mtp-shell-v12-20261125a';
 const SHELL = [
   './',
   './index.html',

@@ -1378,8 +1378,9 @@
       '<div class="section-head">' +
         '<div><h2>일정</h2><p>' + esc(t.cities.join(' · ')) + ' · ' + t.days.length + '일</p></div>' +
         '<div class="head-actions">' +
+          '<button type="button" class="btn btn-soft btn-sm" data-action="open-route-map" aria-label="동선 보기 지도 열기">🗺️ 동선 보기</button>' +
           '<button type="button" class="btn btn-primary btn-sm" data-action="add-item">＋ 일정</button>' +
-          '<button type="button" class="btn btn-soft btn-sm" data-action="add-leg" aria-label="도시·국가 이동 추가">🚆 도시·국가 이동</button>' +
+          '<button type="button" class="btn btn-soft btn-sm" data-action="add-leg" aria-label="도시·국가 이동 추가">🚆 <span class="lbl-wide">도시·국가 이동</span><span class="lbl-narrow">이동</span></button>' +
           '<button type="button" class="btn btn-ghost btn-sm" data-action="open-curation" aria-label="동선 추천 채우기">✨ 동선 추천</button>' +
         '</div>' +
       '</div>' +
@@ -1857,6 +1858,7 @@
     }
   }
   function closeModal() {
+    routeTeardown();
     $('#modalRoot').innerHTML = '';
   }
 
@@ -3991,6 +3993,602 @@
     });
   }
 
+
+  /* ==========================================================================
+     🗺️ 동선 보기 — 팝업 지도 모달 (Leaflet 1.9.4 + OpenStreetMap)
+     · 일정 탭 상단 [🗺️ 동선 보기] 버튼에서 엽니다.
+     · 기존 데이터 스키마·pin-lock·Apps Script 연동은 손대지 않습니다.
+     · 좌표는 일정의 lat/lon 우선 → 없으면 Nominatim으로 1초 간격 순차 조회
+       (조회 결과는 별도 localStorage 캐시에만 저장하고 여행 데이터는 바꾸지 않음)
+     · 끝내 못 찾은 항목은 모달 안 '위치 미확인' 목록으로 정직하게 안내합니다.
+     ========================================================================== */
+  var ROUTE_DAY_COLORS = ['#0F6B63', '#C8562F', '#2A5FA8', '#6B4BA8', '#B87A16', '#2F6F66', '#B3261E', '#3F6B2F'];
+  var ROUTE_GEO_KEY = 'mtp.geo.v1';
+  var ROUTE_LEAFLET_SRI = {
+    js: 'sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=',
+    css: 'sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY='
+  };
+  var ROUTE_LEAFLET_CDN = [
+    { js: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js', css: 'https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css' },
+    { js: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js', css: 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css' }
+  ];
+  var routeState = null;
+  var routeLeafletPromise = null;
+  var routeGeoChain = Promise.resolve();
+  var routeGeoLast = 0;
+  var routeGeoCache = routeReadGeoCache();
+  var routeResizeBound = false;
+
+  function routeReadGeoCache() {
+    try {
+      var raw = localStorage.getItem(ROUTE_GEO_KEY);
+      var obj = raw ? JSON.parse(raw) : null;
+      return (obj && typeof obj === 'object') ? obj : {};
+    } catch (e) { return {}; }
+  }
+
+  function routeWriteGeoCache() {
+    try {
+      var keys = Object.keys(routeGeoCache);
+      if (keys.length > 600) {
+        keys.slice(0, keys.length - 600).forEach(function (k) { delete routeGeoCache[k]; });
+      }
+      localStorage.setItem(ROUTE_GEO_KEY, JSON.stringify(routeGeoCache));
+    } catch (e) { /* 저장 공간이 없어도 동작에는 영향 없음 */ }
+  }
+
+  function routeDayColor(n) {
+    var i = (Math.max(1, Number(n) || 1) - 1) % ROUTE_DAY_COLORS.length;
+    return ROUTE_DAY_COLORS[i];
+  }
+
+  function routeKmLabel(km) {
+    if (!(km >= 0)) return '';
+    return km < 1 ? Math.round(km * 1000) + 'm' : km.toFixed(km < 10 ? 1 : 0) + 'km';
+  }
+
+  /* ---------- Leaflet 지연 로드 (JS + CSS, jsDelivr → unpkg 폴백) ---------- */
+  function routeLoadLeafletAt(i) {
+    if (i >= ROUTE_LEAFLET_CDN.length) return Promise.reject(new Error('leaflet-unavailable'));
+    var src = ROUTE_LEAFLET_CDN[i];
+    return new Promise(function (resolve, reject) {
+      var css = document.createElement('link');
+      css.rel = 'stylesheet';
+      css.href = src.css;
+      css.integrity = ROUTE_LEAFLET_SRI.css;
+      css.crossOrigin = 'anonymous';
+      var js = document.createElement('script');
+      js.src = src.js;
+      js.async = true;
+      js.integrity = ROUTE_LEAFLET_SRI.js;
+      js.crossOrigin = 'anonymous';
+      var done = false;
+      function fail() { if (!done) { done = true; reject(new Error('leaflet-load')); } }
+      js.onload = function () {
+        if (done) return;
+        done = true;
+        if (window.L) resolve(window.L); else reject(new Error('leaflet-missing'));
+      };
+      js.onerror = fail;
+      setTimeout(function () { fail(); }, 12000);
+      document.head.appendChild(css);
+      document.head.appendChild(js);
+    }).catch(function () { return routeLoadLeafletAt(i + 1); });
+  }
+
+  function routeLoadLeaflet() {
+    if (window.L) return Promise.resolve(window.L);
+    if (!routeLeafletPromise) {
+      routeLeafletPromise = routeLoadLeafletAt(0).catch(function (e) {
+        routeLeafletPromise = null;
+        throw e;
+      });
+    }
+    return routeLeafletPromise;
+  }
+
+  /* ---------- 좌표 조회 (Nominatim · 초당 1회 순차 큐 · 캐시) ---------- */
+  function routeGeocode(q) {
+    var key = String(q || '').toLowerCase().replace(/\s+/g, ' ').trim();
+    if (!key) return Promise.resolve(null);
+    if (routeGeoCache[key]) return Promise.resolve(routeGeoCache[key]);
+    function task() {
+      var wait = Math.max(0, 1100 - (Date.now() - routeGeoLast));
+      return new Promise(function (res) { setTimeout(res, wait); }).then(function () {
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new Error('offline');
+        routeGeoLast = Date.now();
+        var url = OSM_NOMINATIM + '?format=json&limit=1&accept-language=ko,en&q=' + encodeURIComponent(key);
+        return fetchTimeout(url, { headers: { 'Accept': 'application/json' } }, 12000);
+      }).then(function (arr) {
+        var hit = arr && arr[0];
+        if (!hit) return null;
+        var lat = Number(hit.lat), lon = Number(hit.lon);
+        if (!isFinite(lat) || !isFinite(lon)) return null;
+        return { lat: lat, lon: lon, label: String(hit.display_name || '') };
+      });
+    }
+    var p = routeGeoChain.then(task, task);
+    routeGeoChain = p.then(function () { }, function () { });
+    return p.then(function (hit) {
+      if (hit) { routeGeoCache[key] = hit; routeWriteGeoCache(); }
+      return hit;
+    });
+  }
+
+  /* 일정 항목의 지도 기준 장소명 — 이동 카드는 도착지 */
+  function routeItemName(it) {
+    if (it.from && it.to) return String(it.to || it.place || '').trim();
+    return String(it.place || it.title || '').trim();
+  }
+
+  function routeQueryFor(t, day, it) {
+    var name = routeItemName(it);
+    if (!name) return '';
+    var city = String(it.city || (day && day.city) || '').trim();
+    var country = String(it.country || t.country || '').trim();
+    var parts = [name];
+    var low = name.toLowerCase();
+    if (city && low.indexOf(city.toLowerCase()) < 0) parts.push(city);
+    if (country && parts.join(' ').toLowerCase().indexOf(country.toLowerCase()) < 0) parts.push(country);
+    return parts.join(', ');
+  }
+
+  function routePointCoord(t, p) {
+    var lat = Number(p.item.lat), lon = Number(p.item.lon);
+    if (p.item.lat !== '' && p.item.lon !== '' && isFinite(lat) && isFinite(lon) && !(lat === 0 && lon === 0)) {
+      return Promise.resolve({ lat: lat, lon: lon, label: '일정에 저장된 좌표' });
+    }
+    /* 도시·국가 문맥을 붙여 한 번만 조회합니다. 장소명만으로 다시 찾는 방식은
+       같은 이름의 다른 장소(예: 다른 지역의 '남산')를 엉뚱한 좌표로 찍을 수 있어
+       쓰지 않고, 못 찾은 항목은 '위치 미확인'으로 정직하게 남깁니다. */
+    return routeGeocode(routeQueryFor(t, p.day, p.item));
+  }
+
+  /* ---------- 범위(전체 / DAY n) 수집 ---------- */
+  function routePointsOf(t, scope) {
+    var out = [];
+    list(t.days).forEach(function (d) {
+      if (scope !== 'all' && d.n !== Number(scope)) return;
+      list(d.items).slice().sort(sortByTime).forEach(function (it) {
+        var name = routeItemName(it);
+        if (!name) return;
+        out.push({ n: out.length + 1, day: d, item: it, name: name, ok: false, marker: null });
+      });
+    });
+    return out;
+  }
+
+  function routeScopeLabel(t, scope) {
+    if (scope === 'all') return '전체 ' + t.days.length + '일';
+    var d = list(t.days).filter(function (x) { return x.n === Number(scope); })[0];
+    return 'DAY ' + scope + (d && d.city ? ' · ' + d.city : '');
+  }
+
+  /* ---------- 모달 ---------- */
+  function openRouteMap() {
+    var t = activeTrip();
+    if (!t) return;
+    if (!t.days.length) { toast('일정이 있는 여행에서 열 수 있어요'); return; }
+    var scope = 'all';
+    if (t.days.some(function (d) { return d.n === Number(ui.day); })) scope = String(ui.day);
+    routeState = {
+      trip: t, scope: scope, map: null, layer: null, lineLayer: null, L: null,
+      points: [], placed: [], missing: [], gen: 0, busy: false
+    };
+    openModal(routeModalHtml(t, scope), true);
+    var modalEl = document.querySelector('#modalRoot .modal');
+    if (modalEl) modalEl.classList.add('modal-route');
+    if (!routeResizeBound) {
+      routeResizeBound = true;
+      window.addEventListener('resize', function () { routeInvalidate(); });
+    }
+    routeBuild();
+  }
+
+  function routeModalHtml(t, scope) {
+    var chips = '<button type="button" class="route-chip' + (scope === 'all' ? ' active' : '') + '" role="tab" aria-selected="' + (scope === 'all' ? 'true' : 'false') + '" data-action="route-scope" data-scope="all">전체</button>' +
+      list(t.days).map(function (d) {
+        var on = String(d.n) === String(scope);
+        return '<button type="button" class="route-chip' + (on ? ' active' : '') + '" role="tab" aria-selected="' + (on ? 'true' : 'false') +
+          '" data-action="route-scope" data-scope="' + d.n + '">DAY ' + d.n + '</button>';
+      }).join('');
+    return '<div class="route-modal">' +
+      modalHead('🗺️ 동선 보기', t.title + ' · ' + routeScopeLabel(t, scope)) +
+      '<div class="route-scope" role="tablist" aria-label="동선 범위">' + chips + '</div>' +
+      '<div class="route-main">' +
+        '<div class="route-map-col">' +
+          '<div class="route-map-wrap">' +
+            '<div id="routeMap" class="route-map" role="img" aria-label="일정 동선 지도"></div>' +
+            '<div class="route-status busy" id="routeStatus">지도와 좌표를 준비하는 중…</div>' +
+          '</div>' +
+          '<div class="route-legend" id="routeLegend"></div>' +
+          '<p class="route-hint">OpenStreetMap 기준 · 좌표가 없는 일정은 초당 1회씩 순서대로 조회합니다.</p>' +
+        '</div>' +
+        '<div class="route-side">' +
+          '<div class="route-sum" id="routeSum">일정을 모으는 중…</div>' +
+          '<ol class="route-list" id="routeList"></ol>' +
+          '<div class="route-missing" id="routeMissing" hidden></div>' +
+        '</div>' +
+      '</div>' +
+      '<div class="modal-actions"><button type="button" class="btn btn-ghost" data-action="close-modal">닫기</button></div>' +
+    '</div>';
+  }
+
+  function routeSetStatus(text, kind) {
+    var el = document.getElementById('routeStatus');
+    if (!el) return;
+    el.className = 'route-status' + (kind === 'busy' ? ' busy' : '') + (kind === 'warn' ? ' warn' : '');
+    if (text) el.textContent = text;
+  }
+
+  function routeInvalidate() {
+    var st = routeState;
+    if (!st || !st.map) return;
+    [0, 80, 260, 520].forEach(function (ms) {
+      setTimeout(function () { if (st.map) { try { st.map.invalidateSize(false); } catch (e) { } } }, ms);
+    });
+  }
+
+  /* ---------- 지도 만들기 ---------- */
+  function routeEnsureMap(st, L) {
+    var el = document.getElementById('routeMap');
+    if (!el) return;
+    st.L = L;
+    if (!st.map) {
+      var home = isKorea(st.trip.country) ? [36.4, 127.8] : [22, 12];
+      st.map = L.map(el, {
+        zoomControl: false, scrollWheelZoom: false, worldCopyJump: true,
+        attributionControl: true, fadeAnimation: true
+      }).setView(home, isKorea(st.trip.country) ? 6 : 2);
+      L.control.zoom({ position: 'topright' }).addTo(st.map);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19, minZoom: 2,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a>'
+      }).addTo(st.map);
+      st.layer = L.layerGroup().addTo(st.map);
+      st.lineLayer = L.layerGroup().addTo(st.map);
+    } else if (st.layer) {
+      st.layer.clearLayers();
+      if (st.lineLayer) st.lineLayer.clearLayers();
+    }
+    routeInvalidate();
+  }
+
+  function routePinIcon(L, n, color) {
+    return L.divIcon({
+      className: 'route-pin-wrap',
+      html: '<span class="route-pin" style="background:' + color + '">' + n + '</span>',
+      iconSize: [30, 30],
+      iconAnchor: [15, 15],
+      popupAnchor: [0, -16]
+    });
+  }
+
+  function routeArrowIcon(L, bearing, color) {
+    return L.divIcon({
+      className: 'route-arrow-wrap',
+      html: '<span class="route-arrow" style="transform:rotate(' + Math.round(bearing) + 'deg);border-bottom-color:' + color + '"></span>',
+      iconSize: [12, 12],
+      iconAnchor: [6, 6]
+    });
+  }
+
+  function routeBearing(a, b) {
+    var toRad = Math.PI / 180;
+    var dLon = (b[1] - a[1]) * toRad;
+    var y = Math.sin(dLon) * Math.cos(b[0] * toRad);
+    var x = Math.cos(a[0] * toRad) * Math.sin(b[0] * toRad) - Math.sin(a[0] * toRad) * Math.cos(b[0] * toRad) * Math.cos(dLon);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+
+  function routePopupHtml(st, p) {
+    var t = st.trip;
+    var m = mapInfo(t, {
+      country: p.item.country || t.country,
+      city: p.item.city || p.day.city,
+      place: p.name
+    });
+    var meta;
+    if (p.km !== null && p.km !== undefined) {
+      meta = '<p class="rp-meta">이전 <b>' + esc(p.prevName) + '</b>에서 직선 <b>' + routeKmLabel(p.km) + '</b> · 약 <b>' + travelMin(p.km) + '분</b></p>';
+    } else {
+      meta = '<p class="rp-meta">' + (st.scope === 'all' ? '이 DAY' : '이 코스') + '의 첫 장소</p>';
+    }
+    return '<div class="route-pop">' +
+      '<div class="rp-head">' +
+        '<span class="rp-num" style="background:' + routeDayColor(p.day.n) + '">' + p.pin + '</span>' +
+        '<div class="rp-when"><b>' + esc(p.item.time) + '</b><small>DAY ' + p.day.n + (p.day.city ? ' · ' + esc(p.day.city) : '') + '</small></div>' +
+      '</div>' +
+      '<h4>' + esc(p.name) + '</h4>' +
+      ((p.item.from && p.item.to) ? '<span class="rp-tag">이동 · 도착지</span>' : '') +
+      (p.item.memo ? '<p class="rp-memo">' + esc(p.item.memo) + '</p>' : '') +
+      meta +
+      '<a class="map-btn ' + m.cls + '" href="' + esc(m.url) + '" target="_blank" rel="noopener noreferrer">↗ 길찾기 <span class="map-badge">' + m.badge + '</span></a>' +
+    '</div>';
+  }
+
+  /* 순서 마커 + DAY별 연결선·방향 화살표 */
+  function routeDrawLines(st) {
+    var L = st.L;
+    if (!L || !st.layer) return;
+    if (st.lineLayer) st.lineLayer.clearLayers();
+    else st.lineLayer = L.layerGroup().addTo(st.map);
+    var groups = {}, order = [];
+    st.placed.forEach(function (p) {
+      var k = String(p.day.n);
+      if (!groups[k]) { groups[k] = []; order.push(k); }
+      groups[k].push(p);
+    });
+    order.forEach(function (k) {
+      var pts = groups[k];
+      var color = routeDayColor(Number(k));
+      if (pts.length > 1) {
+        L.polyline(pts.map(function (p) { return [p.lat, p.lon]; }), {
+          color: color, weight: 4, opacity: .85, lineCap: 'round', lineJoin: 'round'
+        }).addTo(st.lineLayer);
+      }
+      for (var i = 1; i < pts.length; i++) {
+        var a = [pts[i - 1].lat, pts[i - 1].lon], b = [pts[i].lat, pts[i].lon];
+        if (a[0] === b[0] && a[1] === b[1]) continue;
+        L.marker([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], {
+          icon: routeArrowIcon(L, routeBearing(a, b), color),
+          interactive: false, keyboard: false
+        }).addTo(st.lineLayer);
+      }
+    });
+  }
+
+  function routeOrderMeta(st) {
+    var lastByDay = {};
+    st.points.forEach(function (p) {
+      p.km = null; p.min = null; p.prevName = '';
+      if (!p.ok) return;
+      var prev = lastByDay[p.day.n];
+      if (prev) {
+        var km = haversineKm(prev.lat, prev.lon, p.lat, p.lon);
+        p.km = km;
+        p.min = travelMin(km);
+        p.prevName = prev.name;
+      }
+      lastByDay[p.day.n] = p;
+    });
+  }
+
+  function routeAddMarker(st, p) {
+    var L = st.L;
+    if (!L || !st.layer) return;
+    var marker = L.marker([p.lat, p.lon], {
+      icon: routePinIcon(L, p.pin, routeDayColor(p.day.n)),
+      title: p.pin + '. ' + p.name,
+      alt: p.pin + '번 ' + p.name,
+      riseOnHover: true,
+      zIndexOffset: 200 * p.pin
+    });
+    marker.bindPopup(routePopupHtml(st, p), { maxWidth: 268, minWidth: 180, closeButton: true, autoPanPadding: [18, 18] });
+    marker.on('click', function () { routeMarkRow(p.n); });
+    marker.addTo(st.layer);
+    p.marker = marker;
+  }
+
+  function routeFit(st, single) {
+    var L = st.L;
+    if (!L || !st.map || !st.placed.length) return;
+    if (single) {
+      st.map.setView([single.lat, single.lon], Math.max(st.map.getZoom(), 14), { animate: false });
+      return;
+    }
+    if (st.placed.length === 1) {
+      st.map.setView([st.placed[0].lat, st.placed[0].lon], 14, { animate: false });
+      return;
+    }
+    var bounds = L.latLngBounds(st.placed.map(function (p) { return [p.lat, p.lon]; }));
+    st.map.fitBounds(bounds, { padding: [30, 30], maxZoom: 15 });
+  }
+
+  /* ---------- 목록·요약 그리기 ---------- */
+  function routePaintList(st) {
+    var ol = document.getElementById('routeList');
+    if (!ol) return;
+    ol.innerHTML = st.points.map(function (p) {
+      var color = routeDayColor(p.day.n);
+      var sub;
+      if (p.state === 'wait') sub = '위치 확인 중…';
+      else if (!p.ok) sub = '위치 미확인';
+      else sub = p.km !== null ? '이전 ' + routeKmLabel(p.km) + ' · 약 ' + p.min + '분' : '시작 지점';
+      var cls = 'route-row' + (p.ok ? '' : ' miss') + (p === st.active ? ' active' : '');
+      return '<li>' +
+        '<button type="button" class="' + cls + '" data-action="route-focus" data-n="' + p.n + '"' + (p.ok ? '' : ' disabled') + '>' +
+          '<span class="rr-num" style="background:' + (p.ok ? color : '#B9B2A2') + '">' + (p.ok ? p.pin : '–') + '</span>' +
+          '<span class="rr-time">' + esc(p.item.time) + '</span>' +
+          '<span class="rr-main"><strong>' + esc(p.name) + '</strong><small>' +
+            (st.scope === 'all' ? 'DAY ' + p.day.n + ' · ' : '') + esc(sub) +
+          '</small></span>' +
+        '</button></li>';
+    }).join('');
+  }
+
+  function routePaintSummary(st) {
+    var sum = document.getElementById('routeSum');
+    if (!sum) return;
+    var total = 0, segs = 0;
+    st.points.forEach(function (p) { if (p.ok && p.km) { total += p.km; segs++; } });
+    var placed = st.placed.length;
+    var text = '📍 지도 ' + placed + '곳';
+    if (segs) text += ' · 구간 ' + segs + '개 · 직선 합계 ' + routeKmLabel(total);
+    if (st.busy) text += ' · 확인 중 ' + st.points.filter(function (p) { return p.state === 'wait'; }).length + '곳';
+    if (st.missing.length) text += ' · 미확인 ' + st.missing.length + '곳';
+    sum.textContent = text;
+  }
+
+  function routePaintLegend(st) {
+    var box = document.getElementById('routeLegend');
+    if (!box) return;
+    if (st.scope !== 'all' || !st.points.length) { box.innerHTML = ''; box.hidden = true; return; }
+    box.hidden = false;
+    var seen = {}, order = [];
+    st.points.forEach(function (p) { if (!seen[p.day.n]) { seen[p.day.n] = 1; order.push(p.day); } });
+    box.innerHTML = order.map(function (d) {
+      return '<span class="rl-item"><i style="background:' + routeDayColor(d.n) + '"></i>DAY ' + d.n + (d.city ? ' ' + esc(d.city) : '') + '</span>';
+    }).join('');
+  }
+
+  function routePaintMissing(st) {
+    var box = document.getElementById('routeMissing');
+    if (!box) return;
+    if (!st.missing.length) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    box.innerHTML = '<strong>📍 위치 미확인 ' + st.missing.length + '곳</strong>' +
+      '<p>지도 좌표를 찾지 못한 일정입니다. 일정에서 장소명을 시·구까지 구체적으로 입력하면 다음에 표시됩니다.</p>' +
+      '<ul>' + st.missing.map(function (p) {
+        return '<li><b>' + (st.scope === 'all' ? 'DAY ' + p.day.n + ' · ' : '') + esc(p.item.time) + '</b> ' + esc(p.name) + '</li>';
+      }).join('') + '</ul>';
+  }
+
+  function routeMarkRow(n) {
+    var st = routeState;
+    if (!st) return;
+    var p = st.points.filter(function (x) { return x.n === Number(n); })[0] || null;
+    st.active = p;
+    Array.prototype.forEach.call(document.querySelectorAll('#routeList .route-row'), function (el) {
+      el.classList.toggle('active', Number(el.dataset.n) === Number(n));
+    });
+  }
+
+  /* ---------- 본체: 범위별 좌표 수집 → 마커·선 그리기 ---------- */
+  function routeBuild() {
+    var st = routeState;
+    if (!st) return;
+    var gen = ++st.gen;
+    st.points = routePointsOf(st.trip, st.scope);
+    st.placed = [];
+    st.missing = [];
+    st.active = null;
+    st.busy = true;
+    st.pinSeq = 0;
+    st.points.forEach(function (p) { p.state = 'wait'; });
+    routePaintList(st);
+    routePaintLegend(st);
+    routePaintMissing(st);
+    routePaintSummary(st);
+    routeSetStatus('지도와 좌표를 준비하는 중…', 'busy');
+    routeInvalidate();
+
+    if (!st.points.length) {
+      st.busy = false;
+      routeSetStatus('이 범위에는 일정이 없습니다', 'warn');
+      routePaintSummary(st);
+      return;
+    }
+
+    routeLoadLeaflet().then(function (L) {
+      if (routeState !== st || st.gen !== gen) return;
+      routeEnsureMap(st, L);
+      var i = 0;
+      function step() {
+        if (routeState !== st || st.gen !== gen) return;
+        if (i >= st.points.length) return routeFinish(st, gen);
+        var p = st.points[i++];
+        routeSetStatus('📍 위치 확인 중 ' + i + ' / ' + st.points.length + ' · ' + p.name, 'busy');
+        routePointCoord(st.trip, p).then(function (hit) {
+          if (routeState !== st || st.gen !== gen) return;
+          p.state = 'done';
+          if (hit) {
+            p.lat = hit.lat;
+            p.lon = hit.lon;
+            p.ok = true;
+            p.pin = ++st.pinSeq;
+            st.placed.push(p);
+            routeOrderMeta(st);
+            routeAddMarker(st, p);
+            routeDrawLines(st);
+            if (st.placed.length === 1) routeFit(st, p);
+          } else {
+            p.ok = false;
+            st.missing.push(p);
+          }
+          routePaintList(st);
+          routePaintSummary(st);
+          routePaintMissing(st);
+          step();
+        }).catch(function () {
+          if (routeState !== st || st.gen !== gen) return;
+          p.state = 'done';
+          p.ok = false;
+          st.missing.push(p);
+          // 재시도를 막지 않도록 실패는 캐시하지 않고, 남은 항목은 계속 시도
+          routePaintList(st);
+          routePaintSummary(st);
+          routePaintMissing(st);
+          step();
+        });
+      }
+      step();
+    }).catch(function () {
+      if (routeState !== st || st.gen !== gen) return;
+      st.busy = false;
+      routeSetStatus('지도(Leaflet)를 불러오지 못했어요 · 오프라인일 수 있습니다', 'warn');
+      routePaintSummary(st);
+      routePaintList(st);
+    });
+  }
+
+  function routeFinish(st, gen) {
+    if (routeState !== st || st.gen !== gen) return;
+    st.busy = false;
+    routePaintSummary(st);
+    routePaintList(st);
+    routeFit(st);
+    if (!st.placed.length) {
+      routeSetStatus('좌표를 찾은 일정이 없습니다 · 장소명을 확인해 주세요', 'warn');
+      return;
+    }
+    routeSetStatus('✅ 동선 ' + st.placed.length + '곳 표시' + (st.missing.length ? ' · 미확인 ' + st.missing.length + '곳' : ''), 'done');
+    setTimeout(function () {
+      var el = document.getElementById('routeStatus');
+      if (el && st === routeState && !st.busy) el.hidden = true;
+    }, 2600);
+  }
+
+  function routeChangeScope(scope) {
+    var st = routeState;
+    if (!st) return;
+    var next = scope === 'all' ? 'all' : String(Number(scope));
+    if (next === st.scope) return;
+    st.scope = next;
+    Array.prototype.forEach.call(document.querySelectorAll('#modalRoot .route-chip'), function (el) {
+      var on = el.dataset.scope === next;
+      el.classList.toggle('active', on);
+      el.setAttribute('aria-selected', on ? 'true' : 'false');
+    });
+    var head = document.querySelector('#modalRoot .modal-head p');
+    if (head) head.textContent = st.trip.title + ' · ' + routeScopeLabel(st.trip, next);
+    var statusEl = document.getElementById('routeStatus');
+    if (statusEl) statusEl.hidden = false;
+    if (st.map) st.map.closePopup();
+    routeBuild();
+  }
+
+  function routeFocusPoint(n) {
+    var st = routeState;
+    if (!st || !st.map) return;
+    var p = st.points.filter(function (x) { return x.n === Number(n); })[0];
+    if (!p || !p.ok || !p.marker) return;
+    st.map.flyTo([p.lat, p.lon], Math.max(st.map.getZoom(), 14), { duration: .45 });
+    p.marker.openPopup();
+    routeMarkRow(p.n);
+    var row = document.querySelector('#routeList .route-row[data-n="' + p.n + '"]');
+    if (row && row.scrollIntoView) { try { row.scrollIntoView({ block: 'nearest' }); } catch (e) { } }
+  }
+
+  function routeTeardown() {
+    if (!routeState) return;
+    routeState.gen++;
+    if (routeState.map) {
+      try { routeState.map.remove(); } catch (e) { }
+    }
+    routeState = null;
+  }
+
   /* ---------- events ---------- */
   var CLICK = {
     'tab': function (el) { ui.tab = el.dataset.tab; ui.allDays = false; render(); window.scrollTo(0, 0); },
@@ -4090,6 +4688,9 @@
     },
     'add-leg': function () { openLegModal(null); },
     'open-curation': function () { openCuration(); },
+    'open-route-map': function () { openRouteMap(); },
+    'route-scope': function (el) { routeChangeScope(el.dataset.scope); },
+    'route-focus': function (el) { routeFocusPoint(el.dataset.n); },
     'cur-all': function () { setCurBoxes(true); },
     'cur-none': function () { setCurBoxes(false); },
     'cur-cat': function (el) {
