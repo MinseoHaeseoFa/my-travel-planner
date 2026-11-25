@@ -4,7 +4,7 @@
    - 구글 시트(Apps Script) 요청은 캐시하지 않고 그대로 통과
    - Leaflet CDN·OSM 타일(다른 출처)은 그대로 네트워크로 통과 (동선 보기 지도)
 */
-const CACHE = 'mtp-shell-v14-20261125c';
+const CACHE = 'mtp-shell-v15-20261125d';
 const SHELL = [
   './',
   './index.html',

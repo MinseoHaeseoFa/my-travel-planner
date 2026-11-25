@@ -478,7 +478,9 @@
       lon: raw.lon === 0 || raw.lon ? raw.lon : '',
       src: String(raw.src || ''),
       autoKind: (raw.autoKind === 'stay-checkin' || raw.autoKind === 'stay-checkout') ? raw.autoKind : '',
-      staySegId: String(raw.staySegId || '')
+      staySegId: String(raw.staySegId || ''),
+      /* 숙소 자동 일정의 주소를 사용자가 직접 고쳤는지(재생성 시 보존 판단에 사용) — 예전 데이터는 값 없음 */
+      addrCustom: typeof raw.addrCustom === 'boolean' ? raw.addrCustom : undefined
     };
   }
 
@@ -1109,7 +1111,7 @@
     var isIn = kind === 'stay-checkin';
     var bits = [];
     if (isIn) bits.push(staySegNights(seg) + '박');
-    if (lod && lod.address) bits.push(lod.address);
+    /* 주소는 메모가 아니라 전용 '주소' 필드로 넣습니다(카드·수정 모달·길찾기 검색에 그대로 쓰임) */
     if (lod && lod.phone) bits.push('☎ ' + lod.phone);
     return {
       id: uid('it'),
@@ -1118,6 +1120,7 @@
       category: '숙박',
       city: (lod && lod.city) || seg.city || (day && day.city) || '',
       place: name,
+      address: (lod && lod.address) || '',
       memo: bits.join(' · '),
       country: '',
       from: '', to: '', fromCountry: '', toCountry: '', mode: '', arr: '', leg: '',
@@ -1125,13 +1128,41 @@
       lon: lod && lod.lon !== '' && lod.lon !== undefined ? lod.lon : '',
       src: 'stay-plan',
       autoKind: kind,
-      staySegId: seg.id
+      staySegId: seg.id,
+      /* false = 숙소 주소를 그대로 따라가는 자동값(숙소 주소를 고치면 함께 갱신) */
+      addrCustom: false
     };
+  }
+
+  /* 재생성 전에 기존 자동 숙소 일정에 사용자가 직접 넣거나 고친 주소를 구간+종류별로 모읍니다.
+     - addrCustom === true  : 사용자가 고친 값(비운 경우 포함) → 그대로 보존
+     - addrCustom === false : 자동값 → 숙소 주소를 따름
+     - 값 없음(예전 데이터/시트에서 온 항목) : 비어 있지 않고 숙소 주소와 다르면 사용자 값으로 인정 */
+  function stayItemAddressOverrides(t) {
+    var out = {};
+    t.days.forEach(function (d) {
+      list(d.items).forEach(function (x) {
+        if (x.autoKind !== 'stay-checkin' && x.autoKind !== 'stay-checkout') return;
+        if (!x.staySegId) return;
+        var seg = list(t.info.stayPlan).filter(function (s) { return s.id === x.staySegId; })[0];
+        if (!seg) return;
+        var lod = lodgingById(t, seg.lodgingId);
+        var addr = String(x.address || '').trim();
+        var lodAddr = String((lod && lod.address) || '').trim();
+        var custom = x.addrCustom === true || (x.addrCustom === undefined && addr !== '' && addr !== lodAddr);
+        if (!custom) return;
+        var key = x.staySegId + '|' + x.autoKind;
+        if (!Object.prototype.hasOwnProperty.call(out, key)) out[key] = addr;
+      });
+    });
+    return out;
   }
 
   /* 자동 생성 숙소 일정만 지우고 다시 만든다(중복 생성 없음) */
   function syncStayItems(t) {
     if (!t || !list(t.days).length) return { removed: 0, added: 0 };
+    /* 사용자가 직접 고친 주소는 지웠다 다시 만들어도 남깁니다 */
+    var keptAddr = stayItemAddressOverrides(t);
     var removed = 0;
     t.days.forEach(function (d) {
       d.items = d.items.filter(function (x) {
@@ -1140,14 +1171,24 @@
       });
     });
     var added = 0;
+    function addStayItem(seg, kind, day) {
+      var it = stayItemFor(t, seg, kind, day);
+      var key = seg.id + '|' + kind;
+      if (Object.prototype.hasOwnProperty.call(keptAddr, key)) {
+        it.address = keptAddr[key];
+        it.addrCustom = true;
+      }
+      day.items.push(it);
+      added++;
+    }
     list(t.info.stayPlan).forEach(function (seg) {
       if (!seg.hideCheckin) {
         var d1 = stayDayByDate(t, seg.checkinDate);
-        if (d1) { d1.items.push(stayItemFor(t, seg, 'stay-checkin', d1)); added++; }
+        if (d1) addStayItem(seg, 'stay-checkin', d1);
       }
       if (!seg.hideCheckout) {
         var d2 = stayDayByDate(t, seg.checkoutDate);
-        if (d2) { d2.items.push(stayItemFor(t, seg, 'stay-checkout', d2)); added++; }
+        if (d2) addStayItem(seg, 'stay-checkout', d2);
       }
     });
     t.days.forEach(function (d) { d.items.sort(sortByTime); });
@@ -3420,6 +3461,12 @@
       memo: String(v.memo || '').trim(),
       country: v.country && v.country !== '__trip__' ? v.country : ''
     });
+    /* 숙소 자동 일정의 주소를 사용자가 고친 값이면 이후 재생성에서도 지우지 않습니다(비운 경우 포함) */
+    if (item.autoKind && item.staySegId) {
+      var staySeg = list(t.info.stayPlan).filter(function (s) { return s.id === item.staySegId; })[0];
+      var stayLod = staySeg ? lodgingById(t, staySeg.lodgingId) : null;
+      item.addrCustom = String(item.address || '') !== String((stayLod && stayLod.address) || '').trim();
+    }
     var newQueries = routeQueriesFor(t, target, item);
     oldQueries.forEach(function (q) { if (newQueries.indexOf(q) < 0) routeForgetGeo(q); });
     /* 숙소 자동 일정을 고치면 정보 탭 숙소 계획(구간)에도 시간·날짜를 반영 */
